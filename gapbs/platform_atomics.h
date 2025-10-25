@@ -127,3 +127,4 @@ Wrappers for compiler intrinsics for atomic memory operations (AMOs)
 #endif  // else defined _OPENMP
 
 #endif  // PLATFORM_ATOMICS_H_
+

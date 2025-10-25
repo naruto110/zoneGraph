@@ -67,3 +67,4 @@ class Bitmap {
 };
 
 #endif  // BITMAP_H_
+

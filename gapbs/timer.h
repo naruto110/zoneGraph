@@ -47,3 +47,4 @@ class Timer {
 #define TIME_OP(t, op) { t.Start(); (op); t.Stop(); }
 
 #endif  // TIMER_H_
+
