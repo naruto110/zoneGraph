@@ -128,3 +128,4 @@ Wrappers for compiler intrinsics for atomic memory operations (AMOs)
 
 #endif  // PLATFORM_ATOMICS_H_
 
+

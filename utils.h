@@ -441,3 +441,4 @@ void releaseBlock(Vertex *v, int32_t blk_idx)
 }
 
 #endif
+
