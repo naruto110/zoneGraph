@@ -7,7 +7,6 @@ zoneGraph is a research prototype for maintaining dynamic graphs directly on NVM
 - Vertex representation that keeps hot neighbors in an in-DRAM cache (`CACHE_BLK_SIZE`) and spills cold data to PMA-managed blocks (`pm_blk`).
 - Parallel ingestion pipelines (`graph_maintenance_parallel*`) that batch edges, flush blocks to ZNS, and run background garbage collection.
 - Recovery path (`graph_recovery`) that reloads vertex state from the device without rebuilding the entire graph.
-- GAP Benchmark Suite integration (`gapbs/`) providing PageRank, BFS, and supporting utility code.
 
 ## Requirements
 - Linux with NVMe Zoned Namespace (ZNS) support and a device exposed through `libzbd`.
