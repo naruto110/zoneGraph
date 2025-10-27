@@ -11,7 +11,7 @@ zoneGraph is a research prototype for maintaining dynamic graphs directly on NVM
 ## Requirements
 - Linux with NVMe Zoned Namespace (ZNS) support and a device exposed through `libzbd`.
 - C++17-capable compiler with OpenMP support (tested with `g++` 11+).
-- Development headers for `libzbd` (e.g., `sudo apt install libzbd-dev`).
+- Development headers for `libzbd`.
 - Optional: access to real graph datasets in plain edge-list format.
 
 ## Build
@@ -44,12 +44,9 @@ When running against a real device:
 - `global.h` – Global configuration, type definitions, and shared state.
 - `utils.h` – Zoned device helpers, garbage collection, and block allocators.
 - `pma.h` – PMA implementation, graph ingestion logic, recovery, and analytics kernels.
-- `benchmark.h` – PageRank, BFS, and other GAP-inspired routines.
-- `gapbs/` – Third-party headers from the GAP Benchmark Suite.
 
 ## Notes & Next Steps
 - Garbage collection assumes one spare zone (`global_empty_zone`). Adjust thresholds (`ZONE_GC_THRESHOLD`) to tune reclamation behavior.
 - The prototype uses `malloc/new` for buffers; consider integrating a custom allocator if you extend the system.
 - Thread safety relies on `std::shared_timed_mutex` per vertex. Additional synchronization may be needed for new mutation paths.
-- Add your own benchmarks under `gapbs/test/` or extend `benchmark.h` to evaluate new algorithms.
 
