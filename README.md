@@ -1,6 +1,6 @@
 # zoneGraph
 
-zoneGraph is a research prototype for maintaining dynamic graphs directly on NVMe Zoned Namespace (ZNS) devices. The system combines an in-memory cache for low-degree vertices with a Packed Memory Array (PMA) stored in zoned flash, and supports parallel ingestion, recovery, and analytics such as PageRank and BFS.
+zoneGraph is a research prototype for maintaining dynamic graphs directly on NVMe Zoned Namespace (ZNS) devices. The system combines an in-memory cache for low-degree vertices with a Packed Memory Array (PMA) stored in zoned flash, and supports parallel ingestion and recovery.
 
 ## Highlights
 - Zoned storage aware allocator that streams adjacency blocks into sequential zone writes while tracking block metadata in `ZoneStatus`.
