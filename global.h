@@ -28,7 +28,7 @@ using namespace std;
 #define PM_BLK_SIZE 64
 #define CACHE_BLK_SIZE 16 // 小度顶点直接缓存在 DRAM 中的邻居数量
 #define ZONE_BLK_SIZE (PM_BLK_SIZE * sizeof(int32_t))  // 一个逻辑块的字节数
-#define NVME_DEVICE_PATH "/dev/nullb0"
+#define NVME_DEVICE_PATH "/dev/nvme0n1"
 
 int THREAD_NUM = 64;
 

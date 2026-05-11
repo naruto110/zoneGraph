@@ -47,7 +47,7 @@ ScoreT * PageRankPullGS(int max_iters, double epsilon = 1e-4)
             int32_t blk_cnt = v->blk_list.size();
             int32_t *tmp_blk_ptr = nullptr;
 
-            if (v->degree < CACHE_BLK_SIZE) {
+            if (v->blk_list.empty()) {
                 for (int32_t i = 0; i < v->degree; i++) {
                     incoming_total += outgoing_contrib[v->cache_buf[i]];
                 }
@@ -107,7 +107,7 @@ int32_t BUStep(pvector<int32_t> &parent, Bitmap &front, Bitmap &next) {
 
             int32_t *tmp_blk_ptr = nullptr;
 
-            if (v->degree < CACHE_BLK_SIZE) {
+            if (v->blk_list.empty()) {
                 for (int32_t i = 0; i < v->degree; i++) {
                     if (front.get_bit(v->cache_buf[i])) {
                         parent[uidx] = v->cache_buf[i];
@@ -169,7 +169,7 @@ int64_t TDStep(pvector<int32_t> &parent, SlidingQueue<int32_t> &queue) {
             int32_t arr_cap = v->pma->arr_cap;
             int32_t *tmp_blk_ptr = nullptr;
 
-            if (v->degree < CACHE_BLK_SIZE) {
+            if (v->blk_list.empty()) {
                 for (int32_t i = 0; i < v->degree; i++) {
                     int32_t curr_val = parent[v->cache_buf[i]];
                     if (curr_val < 0) {
@@ -490,7 +490,7 @@ pvector<int32_t> ShiloachVishkin(void) {
             int32_t arr_cap = v->pma->arr_cap;
             int32_t *tmp_blk_ptr = nullptr;
 
-            if (v->degree < CACHE_BLK_SIZE) {
+            if (v->blk_list.empty()) {
                 for (int32_t i = 0; i < v->degree; i++) {
                     int32_t comp_u = comp[uidx];
                     int32_t comp_v = comp[v->cache_buf[i]];

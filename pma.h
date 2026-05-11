@@ -38,6 +38,8 @@ void graph_init(int32_t max_vid);
 void graph_maintenance_baseline(void);
 void print_vertex(int32_t vid, int64_t &total_edges);
 void print_graph(void);
+void print_vertex_pma_blocks(int32_t vid);
+void print_all_vertex_pma_blocks(void);
 
 // void mark_zone(int32_t vid, int32_t blk_idx, unsigned long long wp);
 void dumpToZone(void);
@@ -149,6 +151,9 @@ int32_t binary_pma_find(PMA* pma, Vertex *src, int32_t des, int32_t from, int32_
         // while (i >= from && (src->blk_list[blk_idx].blk_ptr[bit_idx] < 0)){
         while (i >= from && (src->blk_list[blk_idx].buf[bit_idx] < 0)){
             i--;
+            if (i < from) {
+                break;
+            }
             blk_idx = i / PM_BLK_SIZE;
             bit_idx = i % PM_BLK_SIZE;
             // 跨块后按需把对应块换入内存
@@ -201,6 +206,9 @@ int32_t binary_pma_find(PMA* pma, Vertex *src, int32_t des, int32_t from, int32_
     // cur_blk = blk_idx;
     while (index >= 0 && (src->blk_list[blk_idx].buf[bit_idx] < 0)) {
         index--;  // 跳过空洞，确保找到真实前驱
+        if (index < 0) {
+            break;
+        }
         blk_idx = index / PM_BLK_SIZE;
         bit_idx = index % PM_BLK_SIZE;
         // 跨块后按需把对应块换入内存
@@ -248,6 +256,9 @@ int32_t binary_pma_find_recovery(PMA* pma, Vertex *src, int32_t des, int32_t fro
         // while (i >= from && (src->blk_list[blk_idx].blk_ptr[bit_idx] < 0)){
         while (i >= from && (src->blk_list[blk_idx].buf[bit_idx] < 0)){
             i--;
+            if (i < from) {
+                break;
+            }
             blk_idx = i / PM_BLK_SIZE;
             bit_idx = i % PM_BLK_SIZE;
             // 跨块后按需把对应块换入内存
@@ -300,6 +311,9 @@ int32_t binary_pma_find_recovery(PMA* pma, Vertex *src, int32_t des, int32_t fro
     // cur_blk = blk_idx;
     while (index >= 0 && (src->blk_list[blk_idx].buf[bit_idx] < 0)) {
         index--;  // 跳过空洞，确保找到真实前驱
+        if (index < 0) {
+            break;
+        }
         blk_idx = index / PM_BLK_SIZE;
         bit_idx = index % PM_BLK_SIZE;
         // 跨块后按需把对应块换入内存
@@ -329,9 +343,18 @@ int32_t pma_insert(PMA* pma, Vertex *src, int32_t des, int32_t index)
         return index;
     }
 
+    if (pma->ele_num >= pma->arr_cap) {
+        resize(pma, src);
+        index = binary_pma_find(pma, src, des, 0, pma->arr_cap - 1);
+        if (index >= 0 && pma_value_at(src, index) == des) {
+            return index;
+        }
+    }
+
     int32_t j = index + 1;
     int32_t blk_idx, bit_idx;
     int32_t inserted_index = index + 1;
+    bool inserted = false;
     // int32_t cur_blk = -1;
     // int32_t *tmp_blk_ptr = new int32_t[PM_BLK_SIZE];
 
@@ -377,6 +400,7 @@ int32_t pma_insert(PMA* pma, Vertex *src, int32_t des, int32_t index)
         }
         src->blk_list[blk_idx].buf[bit_idx] = des;
         inserted_index = index + 1;  // 更新为元素实际插入位置，供后续 rebalance 使用
+        inserted = true;
     } else { /* No empty space to the right of i. Try left. */
         // int32_t be_cur_blk = -1;
         // cout << "test --1 des: " << des << " index: " << index << endl;
@@ -420,7 +444,13 @@ int32_t pma_insert(PMA* pma, Vertex *src, int32_t des, int32_t index)
             }
             src->blk_list[blk_idx].buf[bit_idx] = des;
             inserted_index = index;
+            inserted = true;
         }
+    }
+    if (!inserted) {
+        resize(pma, src);
+        index = binary_pma_find(pma, src, des, 0, pma->arr_cap - 1);
+        return pma_insert(pma, src, des, index);
     }
     pma->ele_num++;
     src->degree++;
@@ -695,10 +725,14 @@ int load_graph(string path)
     std::ifstream inputFile(path);
 
     if (!inputFile) {
-        std::cerr << "Failed to open file." << std::endl;
-        return 1;
+        std::cerr << "Failed to open dataset: " << path << std::endl;
+        return -1;
     }
     cout << "Load dataset " << path << endl;
+
+    global_edge_vec.clear();
+    global_edge_num = 0;
+    global_max_vid = 0;
 
     int32_t src, des;
     while (inputFile >> src >> des) {
@@ -719,7 +753,7 @@ int load_graph(string path)
 
 
     inputFile.close();
-    return 1;
+    return 0;
 }
 
 // 基线初始化：每个顶点预分配一个块缓存，所有插入直接进入 PMA。
@@ -844,11 +878,11 @@ void graph_maintenance_new(void)
 		int32_t index;
         // cout << "insert edge " << edgeIdx << ": (" << src << ", " << des << ")" << endl; 
 
-        if (v->degree < CACHE_BLK_SIZE) { // 小度顶点直接进入缓存
+        if (v->blk_list.empty() && v->degree < CACHE_BLK_SIZE) { // 小度顶点直接进入缓存
             // cout << "test-- cache insert" << endl;
             v->cache_buf[v->degree] = des;
             v->degree++;
-        } else if (v->degree == CACHE_BLK_SIZE) { // 达到阈值后，把缓存中的边整体迁入 PMA
+        } else if (v->blk_list.empty() && v->degree == CACHE_BLK_SIZE) { // 达到阈值后，把缓存中的边整体迁入 PMA
             // cout << "test-- boardline insert" << endl;
             pm_blk new_blk;
             new_blk.buf = new int32_t[PM_BLK_SIZE]; // 在 DRAM 中分配内存
@@ -913,11 +947,11 @@ void graph_maintenance_parallel(void)
             int32_t index;
             // cout << "insert edge " << edgeIdx << ": (" << src << ", " << des << ")" << endl; 
 
-            if (v->degree < CACHE_BLK_SIZE) { // 小度顶点直接进入缓存
+            if (v->blk_list.empty() && v->degree < CACHE_BLK_SIZE) { // 小度顶点直接进入缓存
                 // cout << "test-- cache insert" << endl;
                 v->cache_buf[v->degree] = des;
                 v->degree++;
-            } else if (v->degree == CACHE_BLK_SIZE) { // 达到阈值后，把缓存中的边整体迁入 PMA
+            } else if (v->blk_list.empty() && v->degree == CACHE_BLK_SIZE) { // 达到阈值后，把缓存中的边整体迁入 PMA
                 // cout << "test-- boardline insert" << endl;
                 pm_blk new_blk;
                 new_blk.buf = new int32_t[PM_BLK_SIZE]; // 在 DRAM 中分配内存
@@ -989,11 +1023,11 @@ void graph_maintenance_parallel2(void)
             int32_t index;
             // cout << "insert edge " << edgeIdx << ": (" << src << ", " << des << ")" << endl; 
 
-            if (v->degree < CACHE_BLK_SIZE) { // 小度顶点直接进入缓存
+            if (v->blk_list.empty() && v->degree < CACHE_BLK_SIZE) { // 小度顶点直接进入缓存
                 // cout << "test-- cache insert" << endl;
                 v->cache_buf[v->degree] = des;
                 v->degree++;
-            } else if (v->degree == CACHE_BLK_SIZE) { // 达到阈值后，把缓存中的边整体迁入 PMA
+            } else if (v->blk_list.empty() && v->degree == CACHE_BLK_SIZE) { // 达到阈值后，把缓存中的边整体迁入 PMA
                 // cout << "test-- boardline insert" << endl;
                 pm_blk new_blk;
                 new_blk.buf = new int32_t[PM_BLK_SIZE]; // 在 DRAM 中分配内存
@@ -1047,12 +1081,14 @@ void print_vertex(int32_t vid, int64_t &total_edges)
     Vertex *v = global_vectex_vec[vid];
     int32_t *blk_ptr = new int32_t[PM_BLK_SIZE];
     if (v->degree == 0) {
+        delete[] blk_ptr;
         return;
     }
     // cout << "vid: " << vid << " blknum: " << v->blk_list.size() << " {";
 
-    if (v->degree <= CACHE_BLK_SIZE) {
+    if (v->blk_list.empty()) {
         total_edges += v->degree;
+        delete[] blk_ptr;
         return;
     }
     
@@ -1077,6 +1113,7 @@ void print_vertex(int32_t vid, int64_t &total_edges)
             }
         }
     }
+    delete[] blk_ptr;
     // cout << "}" << endl;
 }
 
@@ -1087,6 +1124,69 @@ void print_graph(void)
         print_vertex(vidx, total_edges);
     }
     cout << "Total number of edges: " << total_edges << endl;
+}
+
+void print_vertex_pma_blocks(int32_t vid)
+{
+    Vertex *v = global_vectex_vec[vid];
+    cout << "Vertex " << vid
+         << " degree=" << v->degree
+         << " pma_ele=" << v->pma->ele_num
+         << " pma_cap=" << v->pma->arr_cap
+         << " blk_count=" << v->blk_list.size() << endl;
+
+    if (v->degree == 0) {
+        cout << "  empty" << endl;
+        return;
+    }
+
+    if (v->blk_list.empty()) {
+        cout << "  cache_buf: [";
+        for (int32_t i = 0; i < v->degree; i++) {
+            cout << v->cache_buf[i];
+            if (i + 1 < v->degree) {
+                cout << ", ";
+            }
+        }
+        cout << "]" << endl;
+        return;
+    }
+
+    int32_t *tmp_blk_ptr = nullptr;
+    for (int32_t blkidx = 0; blkidx < static_cast<int32_t>(v->blk_list.size()); blkidx++) {
+        int32_t *blk_ptr = v->blk_list[blkidx].buf;
+        bool loaded_from_zone = false;
+        if (blk_ptr == nullptr) {
+            readBlockFromZone(zns.dev_fd, tmp_blk_ptr, PM_BLK_SIZE, v->blk_list[blkidx].global_wp);
+            blk_ptr = tmp_blk_ptr;
+            loaded_from_zone = true;
+        }
+
+        cout << "  blk[" << blkidx << "] wp=" << v->blk_list[blkidx].global_wp
+             << " source=" << (loaded_from_zone ? "zone" : "dram")
+             << " values=[";
+        for (int32_t i = 0; i < PM_BLK_SIZE; i++) {
+            cout << blk_ptr[i];
+            if (i + 1 < PM_BLK_SIZE) {
+                cout << ", ";
+            }
+        }
+        cout << "]" << endl;
+
+        if (loaded_from_zone) {
+            delete[] tmp_blk_ptr;
+            tmp_blk_ptr = nullptr;
+        }
+    }
+}
+
+void print_all_vertex_pma_blocks(void)
+{
+    cout << "==== Vertex PMA Blocks Begin ====" << endl;
+    for (int32_t vidx = 0; vidx < static_cast<int32_t>(global_vectex_vec.size()); vidx++) {
+        print_vertex_pma_blocks(vidx);
+    }
+    cout << "==== Vertex PMA Blocks End ====" << endl;
 }
 
 // // 记录物理块到顶点逻辑块的映射，供恢复和 GC 使用
@@ -1222,7 +1322,7 @@ void graph_recovery(void)
         Vertex* v = global_vectex_vec[src];
         unique_lock<std::shared_timed_mutex> lock(v->mutex); // 保证同一顶点同一时刻只处理一条边
         int32_t index;
-        if (v->degree <= CACHE_BLK_SIZE) { // 小度顶点当前不做复杂恢复
+        if (v->blk_list.empty()) { // 小度顶点当前不做复杂恢复
             // v->cache_buf[v->degree] = des;
             // v->degree++;
             continue;
