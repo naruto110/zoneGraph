@@ -1,0 +1,36 @@
+# build outputs
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+Makefile
+compile_commands.json
+
+# binaries / objects
+*.o
+*.so
+*.a
+*.out
+*.exe
+
+# logs
+*.log
+logs/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# editor
+.vscode/
+.idea/
+
+# datasets / large files
+data/
+dataset/
+datasets/
+results/
+outputs/
+tmp/
