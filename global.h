@@ -21,14 +21,34 @@
 #include <mutex>
 #include <atomic>
 #include <random>
+#include <cstdint>
+#include <cstring>
+#include <unordered_map>
 // #include <benchmark.h>
 
 using namespace std;
 
 #define PM_BLK_SIZE 64
-#define CACHE_BLK_SIZE 16 // 小度顶点直接缓存在 DRAM 中的邻居数量
+#define CACHE_BLK_SIZE 4 // 小度顶点直接缓存在 DRAM 中的邻居数量
 #define ZONE_BLK_SIZE (PM_BLK_SIZE * sizeof(int32_t))  // 一个逻辑块的字节数
 #define NVME_DEVICE_PATH "/dev/nvme0n1"
+#define ZNS_BLOCK_MAGIC 0x5A47504D
+#define ZNS_BLOCK_VERSION 1
+#define ZNS_RECORD_SIZE 512
+
+struct ZNSBlockHeader {
+	uint32_t magic;
+	uint32_t version;
+	int32_t src_vid;
+	int32_t pma_blk_idx;
+	uint64_t seq;
+	uint32_t valid_count;
+	uint32_t pma_ele;
+	uint32_t pma_cap;
+	uint32_t checksum;
+};
+
+static inline size_t zns_alloc_unit_size(void);
 
 int THREAD_NUM = 64;
 
@@ -65,33 +85,48 @@ typedef struct new_edge
 	// char type; // edge insertion, graph processing task...
 } newEdge;
 
+enum VertexClass {
+	VERTEX_COLD = 0,
+	VERTEX_HOT = 1,
+	VERTEX_HUB = 2
+};
+
+enum GCMode {
+	GC_GLOBAL = 0,
+	GC_CLASS_AWARE = 1,
+	GC_CLASS_LOCAL = 2
+};
+
 class Vertex {
 public:
 	int32_t id;
 	int32_t degree; // 当前顶点邻居数
 	vector<pm_blk> blk_list; // PMA 对应的块列表
-	PMA* pma; // 顶点的 PMA 元数据
-	int32_t cache_buf[CACHE_BLK_SIZE]; // 小度顶点的快速缓存
-	mutable std::shared_timed_mutex mutex; // 顶点级锁，用于并发插入/恢复
+		PMA* pma; // 顶点的 PMA 元数据
+		int32_t cache_buf[CACHE_BLK_SIZE]; // 小度顶点的快速缓存
+		mutable std::shared_timed_mutex mutex; // 顶点级锁，用于并发插入/恢复
 
-	bool recovery_flag; // 恢复过程中避免重复处理
+		bool recovery_flag; // 恢复过程中避免重复处理
+		int32_t update_count; // 动态更新次数，用于 hot 顶点分类
+		VertexClass vclass; // 可选 vertex-class to zone-class 策略使用
 
-	Vertex(int32_t vid){
-		id = vid;
-		degree = 0;
-		recovery_flag = false;
-		// cache_buf = new int32_t[CACHE_BLK_SIZE];
-		// fill(cache_buf, cache_buf + CACHE_BLK_SIZE, -1);
-	}
+		Vertex(int32_t vid){
+			id = vid;
+			degree = 0;
+			recovery_flag = false;
+			update_count = 0;
+			vclass = VERTEX_COLD;
+			fill(cache_buf, cache_buf + CACHE_BLK_SIZE, -1);
+		}
 
 	~Vertex(){}
 };
 
 typedef struct block_information
 {
-	bool status;
-	int32_t src;
-	int32_t blkIndex; 
+	bool status = false;
+	int32_t src = -1;
+	int32_t blkIndex = -1; 
 } blk_info;
 
 class ZoneStatus {
@@ -108,12 +143,15 @@ public:
 	ZoneStatus(int nb, int vb){
 		nr_blocks = nb;
 		val_blocks = vb;
+		blk_info_vec.resize(nb);
 	}
 
 	~ZoneStatus(){}
 };
 
 int nr_blocks_perzone = 0;
+bool global_zns_record_enabled = false;
+uint64_t global_zns_record_seq = 1;
 
 class MemoryWPQueue {
 public:
@@ -156,7 +194,7 @@ public:
     void refill(unsigned long long wp) {
 		for (int i=0; i < nr_blocks_perzone; i++) {
 			memoryWPs.push(wp);
-			wp += ZONE_BLK_SIZE;
+			wp += zns_alloc_unit_size();
 		}
     }
 
@@ -200,6 +238,21 @@ int32_t global_empty_zone = 0;
 int32_t global_num_queues = 0;
 int64_t global_batch_size = 10000000;  
 double total_dump_time = 0.0;
+bool global_delete_compaction_enabled = false;
+bool global_zone_class_enabled = false;
+GCMode global_gc_mode = GC_GLOBAL;
+int32_t hot_update_threshold = 8;
+int32_t hub_degree_threshold = 1024;
+int32_t hub_block_threshold = 16;
+vector<int32_t> hot_zone_ids;
+vector<int32_t> cold_zone_ids;
+vector<int32_t> hub_zone_ids;
+
+static inline size_t zns_alloc_unit_size(void)
+{
+	return global_zns_record_enabled ? static_cast<size_t>(ZNS_RECORD_SIZE)
+	                                 : static_cast<size_t>(ZONE_BLK_SIZE);
+}
 
 void initial() {
 	/*

@@ -46,10 +46,20 @@ static bool parse_int_arg(const char *arg, int &value)
 
 static void print_usage(const char *program)
 {
-    cerr << "Usage: " << program << " <dataset_id> <thread_num> [mode] [--print-pma]" << endl;
+    cerr << "Usage: " << program << " <dataset_id> <thread_num> [mode] [options]" << endl;
     cerr << "  dataset_id: 0-" << (data_path.size() - 1) << endl;
     cerr << "  mode: baseline | new | parallel | parallel2 (default: parallel2)" << endl;
     cerr << "  --print-pma: print each vertex cache/PMA block after insertion" << endl;
+    cerr << "  --insert <src> <dst>: insert an undirected edge after build" << endl;
+    cerr << "  --delete <src> <dst>: delete an undirected edge after insertion" << endl;
+    cerr << "  --compact-delete: compact PMA layout after each PMA deletion" << endl;
+    cerr << "  --zone-writer: use zone-serial writer when flushing queued/parallel updates" << endl;
+    cerr << "  --zone-class: place hot/cold/hub vertices into separate zone pools" << endl;
+    cerr << "  --gc-global: use original global GC strategy (default)" << endl;
+    cerr << "  --gc-class-aware: choose victim globally, relocate by vertex class" << endl;
+    cerr << "  --gc-class-local: GC requested class first, then fallback globally" << endl;
+    cerr << "  --zns-record: write self-describing ZNS records for recovery experiments" << endl;
+    cerr << "  --recover-zns: recover graph by scanning ZNS records; does not reset zones" << endl;
 }
 
 int main(int argc, char* argv[]) {
@@ -57,7 +67,7 @@ int main(int argc, char* argv[]) {
     // cout << "int size: " << sizeof(int) << endl;
     
     set_path(data_path);
-    if (argc < 3 || argc > 5) {
+    if (argc < 3) {
         print_usage(argv[0]);
         return EXIT_FAILURE;
     }
@@ -79,22 +89,74 @@ int main(int argc, char* argv[]) {
 
     string mode = "parallel2";
     bool print_pma = false;
-    if (argc >= 4) {
-        string arg3 = argv[3];
-        if (arg3 == "--print-pma") {
+    bool mode_set = false;
+    bool use_zone_writer = false;
+    bool recover_zns = false;
+    vector<pair<int32_t, int32_t>> insert_edges;
+    vector<pair<int32_t, int32_t>> delete_edges;
+    for (int argi = 3; argi < argc; argi++) {
+        string arg = argv[argi];
+        if (arg == "--print-pma") {
             print_pma = true;
+        } else if (arg == "--compact-delete") {
+            global_delete_compaction_enabled = true;
+        } else if (arg == "--zone-writer") {
+            use_zone_writer = true;
+        } else if (arg == "--zone-class") {
+            global_zone_class_enabled = true;
+        } else if (arg == "--gc-global") {
+            global_gc_mode = GC_GLOBAL;
+        } else if (arg == "--gc-class-aware") {
+            global_gc_mode = GC_CLASS_AWARE;
+        } else if (arg == "--gc-class-local") {
+            global_gc_mode = GC_CLASS_LOCAL;
+        } else if (arg == "--zns-record") {
+            global_zns_record_enabled = true;
+        } else if (arg == "--recover-zns") {
+            global_zns_record_enabled = true;
+            recover_zns = true;
+        } else if (arg == "--insert") {
+            if (argi + 2 >= argc) {
+                cerr << "--insert requires <src> <dst>" << endl;
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            int insert_src = 0;
+            int insert_dst = 0;
+            if (!parse_int_arg(argv[argi + 1], insert_src) ||
+                !parse_int_arg(argv[argi + 2], insert_dst)) {
+                cerr << "Invalid insert edge: " << argv[argi + 1]
+                     << " " << argv[argi + 2] << endl;
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            insert_edges.push_back({insert_src, insert_dst});
+            argi += 2;
+        } else if (arg == "--delete") {
+            if (argi + 2 >= argc) {
+                cerr << "--delete requires <src> <dst>" << endl;
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            int delete_src = 0;
+            int delete_dst = 0;
+            if (!parse_int_arg(argv[argi + 1], delete_src) ||
+                !parse_int_arg(argv[argi + 2], delete_dst)) {
+                cerr << "Invalid delete edge: " << argv[argi + 1]
+                     << " " << argv[argi + 2] << endl;
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            delete_edges.push_back({delete_src, delete_dst});
+            argi += 2;
         } else {
-            mode = arg3;
-        }
-    }
-    if (argc == 5) {
-        string arg4 = argv[4];
-        if (arg4 == "--print-pma") {
-            print_pma = true;
-        } else {
-            cerr << "Invalid option: " << arg4 << endl;
-            print_usage(argv[0]);
-            return EXIT_FAILURE;
+            if (mode_set) {
+                cerr << "Invalid option: " << arg << endl;
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            mode = arg;
+            mode_set = true;
         }
     }
     string dataPath = data_path[dataset_id];
@@ -119,11 +181,19 @@ int main(int argc, char* argv[]) {
     // cout << "test 0: " << zns.zones_info[0].blk_info_vec[0].src << endl;
     report_device_info(zns.info);
     // report_zones_info(zns.zones, zns.nr_zones);
-    if (zbd_reset_zones(zns.dev_fd, 0, 0) != 0) {
+    if (!recover_zns && zbd_reset_zones(zns.dev_fd, 0, 0) != 0) {
         perror("zbd_reset_zones");
         return EXIT_FAILURE;
     }
 
+    if (recover_zns) {
+        recover_graph_from_zns_records();
+        if (print_pma) {
+            print_all_vertex_pma_blocks();
+        }
+        cout << "total_dump_time: " << total_dump_time << endl;
+        return EXIT_SUCCESS;
+    }
 
     if (load_graph(dataPath) != 0) {
         return EXIT_FAILURE;
@@ -151,12 +221,37 @@ int main(int argc, char* argv[]) {
         print_usage(argv[0]);
         return EXIT_FAILURE;
     }
+    for (const auto &edge : insert_edges) {
+        bool forward_inserted = graph_insert_directed_edge(edge.first, edge.second);
+        bool backward_inserted = graph_insert_directed_edge(edge.second, edge.first);
+        cout << "Insert edge (" << edge.first << ", " << edge.second << "): "
+             << ((forward_inserted || backward_inserted) ? "inserted" : "already exists") << endl;
+    }
+    for (const auto &edge : delete_edges) {
+        bool deleted = graph_delete_undirected_edge(edge.first, edge.second);
+        cout << "Delete edge (" << edge.first << ", " << edge.second << "): "
+             << (deleted ? "deleted" : "not found") << endl;
+    }
+    if ((!insert_edges.empty() || !delete_edges.empty()) &&
+        global_cache_blk >= cache_blk_threshold) {
+        if (use_zone_writer) {
+            dumpToZoneZoneSerial();
+        } else if (mode == "parallel2") {
+            dumpToZoneParallel();
+        } else {
+            dumpToZone();
+        }
+        global_cache_blk = 0;
+    }
+    persist_cache_vertices_as_records();
 
     if (print_pma) {
         print_all_vertex_pma_blocks();
     }
 
-    graph_recovery();
+    if (!global_zns_record_enabled) {
+        graph_recovery();
+    }
     // global_edge_vec.clear();
     // global_edge_vec.shrink_to_fit();
 

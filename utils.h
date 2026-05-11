@@ -12,6 +12,11 @@ using namespace std;
 bool test_block(int zone_idx, int blk_idx);
 void readBlockFromZone(int fd, int32_t* &array, size_t size, unsigned long long wp);
 void writeBlockToZone(int fd, int32_t* array, size_t size, unsigned long long wp);
+void writeZNSRecord(int fd, int32_t src_vid, int32_t pma_blk_idx, PMA *pma,
+                    int32_t *array, size_t size, unsigned long long wp);
+bool readZNSRecordHeader(int fd, ZNSBlockHeader &header, unsigned long long wp);
+void readZNSRecordPayload(int fd, int32_t* &array, size_t size, unsigned long long wp);
+void writeGraphBlockToZone(Vertex *v, int32_t blk_idx, unsigned long long wp);
 void mark_zone(int32_t vid, int32_t blk_idx, unsigned long long wp);
 
 // ZNS 设备的运行时信息。
@@ -81,16 +86,22 @@ int zns_open(void) {
 
 	zns.nr_zones = zns.info.nr_zones;
 	zns.zone_size = zns.info.zone_size;
-	zns.nr_blocks_perzone = zns.zone_size / ZONE_BLK_SIZE;
+	zns.nr_blocks_perzone = zns.zone_size / zns_alloc_unit_size();
+	if (zns.nr_zones == 0 || zns.nr_blocks_perzone == 0) {
+		fprintf(stderr, "Invalid ZNS geometry: nr_zones=%u zone_size=%d block_size=%zu\n",
+				zns.nr_zones, zns.zone_size, zns_alloc_unit_size());
+		zns_close();
+		return -1;
+	}
 	nr_blocks_perzone = zns.nr_blocks_perzone;
 	global_empty_zone = zns.info.nr_zones - 1;  // 默认把最后一个 zone 作为空白缓冲区
 	global_num_queues = zns.nr_zones - 1; // 其余 zone 用于分配可写块
 
-	int total_blks = zns.info.zone_size / ZONE_BLK_SIZE;
+	int total_blks = zns.info.zone_size / zns_alloc_unit_size();
 
+	global_zone_vec.clear();
 	for (int i = 0; i < zns.nr_zones; i++) {
 		ZoneStatus *z = new ZoneStatus(total_blks, 0);
-		z->blk_info_vec.reserve(total_blks);  // 为块级元数据预留空间
 		// cout << "test---0 blk_info_vec[5].status: " << z->blk_info_vec[5].status << endl;
 		global_zone_vec.push_back(z);
 	}
@@ -175,7 +186,6 @@ void garbage_collection() {
 				// cout << "Collect zone: " << zidx << " block: " << blkidx << endl;
 				// rp = zns.zone_size * zidx + ZONE_BLK_SIZE * blkidx;
 				readBlockFromZone(zns.dev_fd, array, PM_BLK_SIZE, rp);
-				writeBlockToZone(zns.dev_fd, array, PM_BLK_SIZE, wp);
 
 				// for (int i=0; i < PM_BLK_SIZE; i++) {
 				// 	cout << array[i] << ",";
@@ -186,14 +196,19 @@ void garbage_collection() {
 				int32_t vid = global_zone_vec[zidx]->blk_info_vec[blkidx].src;
 				int32_t ori_blk_idx = global_zone_vec[zidx]->blk_info_vec[blkidx].blkIndex;
 				Vertex *v = global_vectex_vec[vid];
+				if (global_zns_record_enabled) {
+					writeZNSRecord(zns.dev_fd, vid, ori_blk_idx, v->pma, array, PM_BLK_SIZE, wp);
+				} else {
+					writeBlockToZone(zns.dev_fd, array, PM_BLK_SIZE, wp);
+				}
 				v->blk_list[ori_blk_idx].global_wp = wp; // 新块已写入设备，因此对应 buf 应保持为空
 				global_zone_vec[zidx]->blk_info_vec[blkidx].status = false; // 原块失效
 				// 标记新位置的映射关系
 				mark_zone(vid, ori_blk_idx, wp);
-				wp += ZONE_BLK_SIZE; 
+				wp += zns_alloc_unit_size(); 
 				tmp_used_blk++;
 			}
-			rp += ZONE_BLK_SIZE;
+			rp += zns_alloc_unit_size();
 		}
 		// 把空白 zone 剩余位置重新加入空闲块队列
 		for (int i = tmp_used_blk; i < zns.nr_blocks_perzone; i++) {
@@ -201,7 +216,7 @@ void garbage_collection() {
 			blk.global_wp = wp;
 			blk.buf = nullptr;
 			graph_blk_que.push(blk);
-			wp += ZONE_BLK_SIZE; 
+			wp += zns_alloc_unit_size(); 
 		}
 		// reset 原 zone
 		zbd_reset_zones(zns.dev_fd, (zidx * zns.zone_size), zns.zone_size);
@@ -245,7 +260,6 @@ void garbage_collection_new() {
 				// rp = zns.zone_size * zidx + ZONE_BLK_SIZE * blkidx;
 				// cout << "wp: " << wp << endl;
 				readBlockFromZone(zns.dev_fd, array, PM_BLK_SIZE, rp);
-				writeBlockToZone(zns.dev_fd, array, PM_BLK_SIZE, wp);
 
 				// for (int i=0; i < PM_BLK_SIZE; i++) {
 				// 	cout << array[i] << ",";
@@ -256,14 +270,19 @@ void garbage_collection_new() {
 				int32_t vid = global_zone_vec[zidx]->blk_info_vec[blkidx].src;
 				int32_t ori_blk_idx = global_zone_vec[zidx]->blk_info_vec[blkidx].blkIndex;
 				Vertex *v = global_vectex_vec[vid];
+				if (global_zns_record_enabled) {
+					writeZNSRecord(zns.dev_fd, vid, ori_blk_idx, v->pma, array, PM_BLK_SIZE, wp);
+				} else {
+					writeBlockToZone(zns.dev_fd, array, PM_BLK_SIZE, wp);
+				}
 				v->blk_list[ori_blk_idx].global_wp = wp; // 新块已写入设备，因此对应 buf 应保持为空
 				global_zone_vec[zidx]->blk_info_vec[blkidx].status = false; // 原块失效
 				// 标记新位置的映射关系
 				mark_zone(vid, ori_blk_idx, wp);
-				wp += ZONE_BLK_SIZE; 
+				wp += zns_alloc_unit_size(); 
 				tmp_used_blk++;
 			}
-			rp += ZONE_BLK_SIZE;
+			rp += zns_alloc_unit_size();
 		}
 		// 将空白 zone 剩余块重新加入对应分配队列
 		for (int i = tmp_used_blk; i < zns.nr_blocks_perzone; i++) {
@@ -272,7 +291,7 @@ void garbage_collection_new() {
 			// blk.global_wp = wp;
 			// blk.buf = nullptr;
 			// graph_blk_que.push(blk);
-			wp += ZONE_BLK_SIZE; 
+			wp += zns_alloc_unit_size(); 
 		}
 		// reset 原 zone
 		zbd_reset_zones(zns.dev_fd, (zidx * zns.zone_size), zns.zone_size);
@@ -293,12 +312,17 @@ int generate_block_baseline(int blk_num) {
 	*/
 	// cout << "generate zone blocks" << endl;
 	while (blk_num--) {
+		if (global_blk_wp >= static_cast<unsigned long long>(global_num_queues) *
+			static_cast<unsigned long long>(zns.zone_size)) {
+			std::cerr << "No free baseline blocks before reserved empty zone." << std::endl;
+			exit(EXIT_FAILURE);
+		}
 		pm_blk blk;
 		blk.global_wp = global_blk_wp; // 记录该块在设备上的起始地址
 		// blk.blk_id = global_blk_id;
 		blk.buf = nullptr;
 		global_blk_id++;
-		global_blk_wp += ZONE_BLK_SIZE; // 以字节为单位推进写指针
+		global_blk_wp += zns_alloc_unit_size(); // 以字节为单位推进写指针
 		graph_blk_que.push(blk);
 		// if (global_blk_wp >= global_threshold_wp) {
 
@@ -312,18 +336,55 @@ int generate_block_baseline(int blk_num) {
 void generate_block_opt(void)
 {
 	// 初始化每个 zone 对应的可写块队列
+	global_blk_queues.clear();
+	hot_zone_ids.clear();
+	cold_zone_ids.clear();
+	hub_zone_ids.clear();
+
 	unsigned long long wp = 0;
     for (int zoneidx = 0; zoneidx < global_num_queues; zoneidx++) {
 		MemoryWPQueue* b = new MemoryWPQueue(wp);
         global_blk_queues.push_back(b);
 		wp += zns.zone_size;
     }
+
+	if (global_num_queues <= 0) {
+		return;
+	}
+
+	int32_t hub_count = global_num_queues >= 3 ? 1 : 0;
+	int32_t hot_count = max(1, global_num_queues / 4);
+	if (hot_count + hub_count > global_num_queues) {
+		hot_count = global_num_queues - hub_count;
+	}
+	int32_t hub_start = global_num_queues - hub_count;
+	int32_t cold_start = hot_count;
+	int32_t cold_end = hub_start;
+
+	for (int32_t zoneidx = 0; zoneidx < hot_count; zoneidx++) {
+		hot_zone_ids.push_back(zoneidx);
+	}
+	for (int32_t zoneidx = cold_start; zoneidx < cold_end; zoneidx++) {
+		cold_zone_ids.push_back(zoneidx);
+	}
+	for (int32_t zoneidx = hub_start; zoneidx < global_num_queues; zoneidx++) {
+		hub_zone_ids.push_back(zoneidx);
+	}
+
+	if (cold_zone_ids.empty()) {
+		cold_zone_ids = hot_zone_ids;
+	}
 }
 
 // 并行模式申请可写块
 unsigned long long requestMemoryBlocks(int thread_id) 
 {
     unsigned long long wp = 0;
+
+	if (global_num_queues <= 0 || global_blk_queues.empty()) {
+		std::cerr << "No writable zone queues are available." << std::endl;
+		exit(EXIT_FAILURE);
+	}
 
 	if (global_blk_queues[(thread_id % global_num_queues)]->getNextBlock(wp)) {
 		return wp;
@@ -353,23 +414,27 @@ unsigned long long requestMemoryBlocks(int thread_id)
 void writeBlockToZone(int fd, int32_t* array, size_t size, unsigned long long wp) {
     if (fd == -1) {
         perror("Failed to open file for writing");
-        return;
+        exit(EXIT_FAILURE);
     }
 
     // 按块粒度写入设备
     size_t bytesToWrite = size * sizeof(int32_t);
     if (pwrite(fd, array, bytesToWrite, wp) != bytesToWrite) {
         perror("Failed to write data");
-        close(fd);
-        return;
+        exit(EXIT_FAILURE);
     }
 }
 
 void readBlockFromZone(int fd, int32_t* &array, size_t size, unsigned long long wp) {
+	if (global_zns_record_enabled) {
+		readZNSRecordPayload(fd, array, size, wp);
+		return;
+	}
+
     // 从设备上读取一个逻辑块
     if (fd == -1) {
         perror("Failed to open file for reading");
-        return;
+        exit(EXIT_FAILURE);
     }
 
     // 如有需要，先为读取结果分配内存
@@ -383,16 +448,139 @@ void readBlockFromZone(int fd, int32_t* &array, size_t size, unsigned long long 
     if (pread(fd, array, bytesToRead, wp) != bytesToRead) {
         perror("Failed to read data");
         delete[] array;
-        close(fd);
-        return;
+        array = nullptr;
+        exit(EXIT_FAILURE);
     }
 
     // close(fd);
 }
 
+static uint32_t zns_record_checksum(const ZNSBlockHeader &header,
+                                    const int32_t *array,
+                                    size_t size)
+{
+    uint32_t hash = 2166136261u;
+    ZNSBlockHeader tmp = header;
+    tmp.checksum = 0;
+    const unsigned char *header_bytes =
+        reinterpret_cast<const unsigned char *>(&tmp);
+    for (size_t i = 0; i < sizeof(ZNSBlockHeader); i++) {
+        hash ^= header_bytes[i];
+        hash *= 16777619u;
+    }
+    const unsigned char *payload_bytes =
+        reinterpret_cast<const unsigned char *>(array);
+    for (size_t i = 0; i < size * sizeof(int32_t); i++) {
+        hash ^= payload_bytes[i];
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+static uint32_t count_payload_values(const int32_t *array, size_t size)
+{
+    uint32_t count = 0;
+    for (size_t i = 0; i < size; i++) {
+        if (array[i] >= 0) {
+            count++;
+        }
+    }
+    return count;
+}
+
+void writeZNSRecord(int fd, int32_t src_vid, int32_t pma_blk_idx, PMA *pma,
+                    int32_t *array, size_t size, unsigned long long wp)
+{
+    if (fd == -1) {
+        perror("Failed to open file for ZNS record writing");
+        exit(EXIT_FAILURE);
+    }
+    if (sizeof(ZNSBlockHeader) + size * sizeof(int32_t) > ZNS_RECORD_SIZE) {
+        std::cerr << "ZNS record payload is larger than ZNS_RECORD_SIZE." << std::endl;
+        exit(EXIT_FAILURE);
+    }
+
+    char record[ZNS_RECORD_SIZE];
+    memset(record, 0, sizeof(record));
+
+    ZNSBlockHeader header;
+    memset(&header, 0, sizeof(header));
+    header.magic = ZNS_BLOCK_MAGIC;
+    header.version = ZNS_BLOCK_VERSION;
+    header.src_vid = src_vid;
+    header.pma_blk_idx = pma_blk_idx;
+    header.seq = global_zns_record_seq++;
+    header.valid_count = count_payload_values(array, size);
+    header.pma_ele = pma == nullptr ? header.valid_count : static_cast<uint32_t>(pma->ele_num);
+    header.pma_cap = pma == nullptr ? static_cast<uint32_t>(size) : static_cast<uint32_t>(pma->arr_cap);
+    header.checksum = zns_record_checksum(header, array, size);
+
+    memcpy(record, &header, sizeof(header));
+    memcpy(record + sizeof(ZNSBlockHeader), array, size * sizeof(int32_t));
+
+    if (pwrite(fd, record, ZNS_RECORD_SIZE, wp) != ZNS_RECORD_SIZE) {
+        perror("Failed to write ZNS record");
+        exit(EXIT_FAILURE);
+    }
+}
+
+bool readZNSRecordHeader(int fd, ZNSBlockHeader &header, unsigned long long wp)
+{
+    if (fd == -1) {
+        perror("Failed to open file for ZNS record header reading");
+        exit(EXIT_FAILURE);
+    }
+    char record[ZNS_RECORD_SIZE];
+    if (pread(fd, record, ZNS_RECORD_SIZE, wp) != ZNS_RECORD_SIZE) {
+        perror("Failed to read ZNS record header");
+        exit(EXIT_FAILURE);
+    }
+    memcpy(&header, record, sizeof(ZNSBlockHeader));
+    return header.magic == ZNS_BLOCK_MAGIC &&
+           header.version == ZNS_BLOCK_VERSION;
+}
+
+void readZNSRecordPayload(int fd, int32_t* &array, size_t size, unsigned long long wp)
+{
+    if (fd == -1) {
+        perror("Failed to open file for ZNS record payload reading");
+        exit(EXIT_FAILURE);
+    }
+    char record[ZNS_RECORD_SIZE];
+    if (pread(fd, record, ZNS_RECORD_SIZE, wp) != ZNS_RECORD_SIZE) {
+        perror("Failed to read ZNS record payload");
+        exit(EXIT_FAILURE);
+    }
+    ZNSBlockHeader header;
+    memcpy(&header, record, sizeof(ZNSBlockHeader));
+    if (header.magic != ZNS_BLOCK_MAGIC || header.version != ZNS_BLOCK_VERSION) {
+        std::cerr << "Invalid ZNS record header at wp=" << wp << std::endl;
+        exit(EXIT_FAILURE);
+    }
+	if (array == nullptr) {
+		array = new int32_t[size];
+	}
+    memcpy(array, record + sizeof(ZNSBlockHeader), size * sizeof(int32_t));
+    uint32_t checksum = zns_record_checksum(header, array, size);
+    if (checksum != header.checksum) {
+        std::cerr << "ZNS record checksum mismatch at wp=" << wp << std::endl;
+        exit(EXIT_FAILURE);
+    }
+}
+
+void writeGraphBlockToZone(Vertex *v, int32_t blk_idx, unsigned long long wp)
+{
+    if (global_zns_record_enabled) {
+        writeZNSRecord(zns.dev_fd, v->id, blk_idx, v->pma,
+                       v->blk_list[blk_idx].buf, PM_BLK_SIZE, wp);
+    } else {
+        writeBlockToZone(zns.dev_fd, v->blk_list[blk_idx].buf, PM_BLK_SIZE, wp);
+    }
+}
+
 void validBlock(unsigned long long	wp) {
 	int32_t zone_idx = wp / zns.zone_size; 
-	int32_t blk_idx = (wp % zns.zone_size) / ZONE_BLK_SIZE;
+	int32_t blk_idx = (wp % zns.zone_size) / zns_alloc_unit_size();
 	global_zone_vec[zone_idx]->blk_info_vec[blk_idx].status = true;
 	// global_zone_vec[zone_idx]
 	// zns.zones_info[zone_idx].blk_info_vec[blk_idx].status = 1;
@@ -400,7 +588,7 @@ void validBlock(unsigned long long	wp) {
 
 void invalidBlock(unsigned long long wp) {
 	int32_t zone_idx = wp / zns.zone_size; 
-	int32_t blk_idx = (wp % zns.zone_size) / ZONE_BLK_SIZE;
+	int32_t blk_idx = (wp % zns.zone_size) / zns_alloc_unit_size();
 	// cout << "wp: " << wp << " zone size: " << zns.zone_size << 
 	
 	global_zone_vec[zone_idx]->blk_info_vec[blk_idx].status = false;
@@ -418,7 +606,7 @@ void mark_zone(int32_t vid, int32_t blk_idx, unsigned long long wp)
 {
     // cout << "zone size: " << zns.info.zone_size << endl;
     int32_t zone_idx = wp / zns.info.zone_size; // 所属 zone 编号
-    int32_t info_idx = (wp % zns.info.zone_size) / ZONE_BLK_SIZE; // 在 zone 内的块编号
+    int32_t info_idx = (wp % zns.info.zone_size) / zns_alloc_unit_size(); // 在 zone 内的块编号
     global_zone_vec[zone_idx]->blk_info_vec[info_idx].status = true;
     global_zone_vec[zone_idx]->blk_info_vec[info_idx].src = vid;
     global_zone_vec[zone_idx]->blk_info_vec[info_idx].blkIndex = blk_idx;
