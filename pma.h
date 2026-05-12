@@ -116,6 +116,25 @@ static inline int32_t pma_value_at(Vertex *src, int32_t index) {
     return src->blk_list[blk_idx].buf[bit_idx];
 }
 
+static inline int32_t pma_value_at_readonly(Vertex *src, int32_t index) {
+    if (index < 0) {
+        return -1;
+    }
+
+    int32_t blk_idx = index / PM_BLK_SIZE;
+    int32_t bit_idx = index % PM_BLK_SIZE;
+    if (src->blk_list[blk_idx].buf != nullptr) {
+        return src->blk_list[blk_idx].buf[bit_idx];
+    }
+
+    int32_t *tmp_blk_ptr = nullptr;
+    readBlockFromZone(zns.dev_fd, tmp_blk_ptr, PM_BLK_SIZE,
+                      src->blk_list[blk_idx].global_wp);
+    int32_t value = tmp_blk_ptr[bit_idx];
+    delete[] tmp_blk_ptr;
+    return value;
+}
+
 static int32_t count_window_occupancy(Vertex *src, int32_t from, int32_t to) {
     int32_t occupancy = 0;
     for (int32_t idx = from; idx < to; idx++) {
@@ -769,7 +788,7 @@ void resize (PMA* pma, Vertex *src)
     
 
     for (int32_t i=0; i < ex_blk_num; i++) {
-        pm_blk new_blk;
+        pm_blk new_blk{};
         new_blk.buf = new int32_t[PM_BLK_SIZE];
         fill(new_blk.buf, new_blk.buf + PM_BLK_SIZE, -1);
         src->blk_list.push_back(new_blk);
@@ -848,7 +867,7 @@ void graph_init(int32_t max_vid)
         // cout << "vidx: " << vidx << " global_blk_vec size:" << global_blk_vec.size() << endl;
 		Vertex* v = new Vertex(vidx);
         // 每个顶点先分配一个块缓存，作为初始邻接存储
-        pm_blk new_blk;
+        pm_blk new_blk{};
         new_blk.buf = new int32_t[PM_BLK_SIZE]; // 在 DRAM 中分配内存
         fill(new_blk.buf, new_blk.buf + PM_BLK_SIZE, -1);
         v->blk_list.push_back(new_blk);
@@ -970,6 +989,16 @@ bool cache_delete(Vertex *v, int32_t des)
     return false;
 }
 
+static bool cache_contains(Vertex *v, int32_t des)
+{
+    for (int32_t i = 0; i < v->degree; i++) {
+        if (v->cache_buf[i] == des) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool graph_insert_directed_edge(int32_t src, int32_t des)
 {
     if (src < 0 || src >= static_cast<int32_t>(global_vectex_vec.size())) {
@@ -979,12 +1008,11 @@ bool graph_insert_directed_edge(int32_t src, int32_t des)
     Vertex *v = global_vectex_vec[src];
     unique_lock<std::shared_timed_mutex> lock(v->mutex);
     if (v->blk_list.empty()) {
-        for (int32_t i = 0; i < v->degree; i++) {
-            if (v->cache_buf[i] == des) {
-                return false;
-            }
+        if (cache_contains(v, des)) {
+            return false;
         }
-        if (v->degree < CACHE_BLK_SIZE) {
+        if (v->degree < global_cache_buf_threshold) {
+            appendZNSRedoLog(EDGE_LOG_INSERT, src, des);
             bool inserted = cache_insert_unique(v, des);
             if (inserted) {
                 v->update_count++;
@@ -993,7 +1021,7 @@ bool graph_insert_directed_edge(int32_t src, int32_t des)
             return inserted;
         }
 
-        pm_blk new_blk;
+        pm_blk new_blk{};
         new_blk.buf = new int32_t[PM_BLK_SIZE];
         fill(new_blk.buf, new_blk.buf + PM_BLK_SIZE, -1);
         v->blk_list.push_back(new_blk);
@@ -1009,6 +1037,10 @@ bool graph_insert_directed_edge(int32_t src, int32_t des)
     }
 
     int32_t index = binary_pma_find(v->pma, v, des, 0, v->pma->arr_cap - 1);
+    if (index >= 0 && pma_value_at_readonly(v, index) == des) {
+        return false;
+    }
+    appendZNSRedoLog(EDGE_LOG_INSERT, src, des);
     int32_t old_degree = v->degree;
     pma_insert(v->pma, v, des, index);
     bool inserted = v->degree != old_degree;
@@ -1028,8 +1060,17 @@ bool graph_delete_directed_edge(int32_t src, int32_t des)
     unique_lock<std::shared_timed_mutex> lock(v->mutex);
     bool deleted = false;
     if (v->blk_list.empty()) {
+        if (!cache_contains(v, des)) {
+            return false;
+        }
+        appendZNSRedoLog(EDGE_LOG_DELETE, src, des);
         deleted = cache_delete(v, des);
     } else {
+        int32_t index = binary_pma_find(v->pma, v, des, 0, v->pma->arr_cap - 1);
+        if (index < 0 || pma_value_at_readonly(v, index) != des) {
+            return false;
+        }
+        appendZNSRedoLog(EDGE_LOG_DELETE, src, des);
         deleted = pma_delete(v->pma, v, des);
     }
     if (deleted) {
@@ -1381,38 +1422,7 @@ void graph_maintenance_parallel(void)
         for (int64_t edgeIdx = start_e; edgeIdx < end_e; edgeIdx++)
         {
             new_edge e = global_edge_vec[edgeIdx];  // 从边数组中取出当前边
-            int32_t src = e.src;
-            int32_t des = e.des;
-            Vertex* v = global_vectex_vec[src];
-            unique_lock<std::shared_timed_mutex> lock(v->mutex); // 保证同一顶点同一时刻只处理一条边
-            int32_t index;
-            // cout << "insert edge " << edgeIdx << ": (" << src << ", " << des << ")" << endl; 
-
-            if (v->blk_list.empty() && v->degree < CACHE_BLK_SIZE) { // 小度顶点直接进入缓存
-                // cout << "test-- cache insert" << endl;
-                cache_insert_unique(v, des);
-            } else if (v->blk_list.empty() && v->degree == CACHE_BLK_SIZE) { // 达到阈值后，把缓存中的边整体迁入 PMA
-                // cout << "test-- boardline insert" << endl;
-                pm_blk new_blk;
-                new_blk.buf = new int32_t[PM_BLK_SIZE]; // 在 DRAM 中分配内存
-                fill(new_blk.buf, new_blk.buf + PM_BLK_SIZE, -1);
-                v->blk_list.push_back(new_blk);
-                global_cache_blk++;
-                v->degree = 0;
-                for (int i = 0; i < CACHE_BLK_SIZE; i++) {
-                    des = v->cache_buf[i];
-                    index = binary_pma_find(v->pma, v, des, 0, v->pma->arr_cap-1);
-                    pma_insert(v->pma, v, des, index);
-                }
-                des = e.des;  // 再插入当前这条新边
-                index = binary_pma_find(v->pma, v, des, 0, v->pma->arr_cap-1);
-                pma_insert(v->pma, v, des, index);
-            } else {
-                // cout << "test-- PMA insert" << endl;
-                index = binary_pma_find(v->pma, v, des, 0, v->pma->arr_cap-1);
-                pma_insert(v->pma, v, des, index);
-
-            }
+            graph_insert_directed_edge(e.src, e.des);
         }
 
         if (global_cache_blk >= cache_blk_threshold) {
@@ -1456,38 +1466,7 @@ void graph_maintenance_parallel2(void)
         for (int64_t edgeIdx = start_e; edgeIdx < end_e; edgeIdx++)
         {
             new_edge e = global_edge_vec[edgeIdx];  // 从边数组中取出当前边
-            int32_t src = e.src;
-            int32_t des = e.des;
-            Vertex* v = global_vectex_vec[src];
-            unique_lock<std::shared_timed_mutex> lock(v->mutex); // 保证同一顶点同一时刻只处理一条边
-            int32_t index;
-            // cout << "insert edge " << edgeIdx << ": (" << src << ", " << des << ")" << endl; 
-
-            if (v->blk_list.empty() && v->degree < CACHE_BLK_SIZE) { // 小度顶点直接进入缓存
-                // cout << "test-- cache insert" << endl;
-                cache_insert_unique(v, des);
-            } else if (v->blk_list.empty() && v->degree == CACHE_BLK_SIZE) { // 达到阈值后，把缓存中的边整体迁入 PMA
-                // cout << "test-- boardline insert" << endl;
-                pm_blk new_blk;
-                new_blk.buf = new int32_t[PM_BLK_SIZE]; // 在 DRAM 中分配内存
-                fill(new_blk.buf, new_blk.buf + PM_BLK_SIZE, -1);
-                v->blk_list.push_back(new_blk);
-                global_cache_blk++;
-                v->degree = 0;
-                for (int i = 0; i < CACHE_BLK_SIZE; i++) {
-                    des = v->cache_buf[i];
-                    index = binary_pma_find(v->pma, v, des, 0, v->pma->arr_cap-1);
-                    pma_insert(v->pma, v, des, index);
-                }
-                des = e.des;  // 再插入当前这条新边
-                index = binary_pma_find(v->pma, v, des, 0, v->pma->arr_cap-1);
-                pma_insert(v->pma, v, des, index);
-            } else {
-                // cout << "test-- PMA insert" << endl;
-                index = binary_pma_find(v->pma, v, des, 0, v->pma->arr_cap-1);
-                pma_insert(v->pma, v, des, index);
-
-            }
+            graph_insert_directed_edge(e.src, e.des);
         }
 
         if (global_cache_blk >= cache_blk_threshold) {
@@ -1652,6 +1631,7 @@ void dumpToZone(void)
 {
     // int total_blks = 0;
     double start_t = get_current_time();
+    beginZNSEpoch();
     for (int32_t vidx = 0; vidx < global_vectex_vec.size(); vidx++) {
         Vertex *v = global_vectex_vec[vidx];
         // cout << "dump vid: " << v->id << " degree: " << v->degree << " blks: " << v->blk_list.size() << endl;
@@ -1663,7 +1643,8 @@ void dumpToZone(void)
                 // total_blks++;
                 // cout << "dump vid: " << v->id << endl;
 
-                pm_blk new_blk;
+                pm_blk new_blk{};
+                new_blk.buf = nullptr;
                 if (global_zone_class_enabled && !global_blk_queues.empty()) {
                     if (!requestClassifiedBlock(v, new_blk.global_wp)) {
                         std::cerr << "No free classified blocks for dump." << std::endl;
@@ -1689,6 +1670,7 @@ void dumpToZone(void)
             }
         }
     }
+    commitZNSEpoch();
     double end_t = get_current_time();
     cout << "Dump to zone time: " << end_t - start_t << endl;
     // cout << "total_blks: " << total_blks << endl;
@@ -1697,51 +1679,10 @@ void dumpToZone(void)
 // 并行刷盘：每个线程从可写块队列中申请物理地址并刷回设备。
 void dumpToZoneParallel(void)
 {
-    omp_set_num_threads(THREAD_NUM);
-    double start_t = get_current_time();
-    #pragma omp parallel for
-    for (int32_t vidx = 0; vidx < global_vectex_vec.size(); vidx++) {
-        int threadId = omp_get_thread_num();
-        Vertex *v = global_vectex_vec[vidx];
-        // cout << "dump vid: " << v->id << " degree: " << v->degree << " blks: " << v->blk_list.size() << endl;
-        if ((v->degree > 0) && (v->blk_list.size() > 0)) {
-            for (int blkidx = 0; blkidx < v->blk_list.size(); blkidx++) {
-                if (v->blk_list[blkidx].buf == nullptr) { // 该块当前不在 DRAM 中
-                    continue;
-                }
-
-                // if (graph_blk_que.size() == 0) {
-                //     garbage_collection();
-                // }
-
-                unsigned long long wp = 0;
-                if (global_zone_class_enabled) {
-                    if (!requestClassifiedBlock(v, wp)) {
-                        std::cerr << "No free classified blocks for parallel dump." << std::endl;
-                        exit(EXIT_FAILURE);
-                    }
-                } else {
-                    wp = requestMemoryBlocks(threadId);
-                }
-                // cout << "dump wp: " << wp << endl;
-                
-                writeGraphBlockToZone(v, blkidx, wp);
-                // cout << " write to zone done." << endl;
-                delete[] v->blk_list[blkidx].buf;
-                mark_zone(v->id, blkidx, wp);  // 更新块映射，供 GC 和恢复使用
-                // 更新顶点侧的物理地址元数据
-                // v->blk_list[blkidx] = new_blk;
-                v->blk_list[blkidx].buf = nullptr;
-                v->blk_list[blkidx].global_wp = wp;
-
-                global_cache_blk--;
-            }
-        }
-    }
-    double end_t = get_current_time();
-    cout << "Dump to zone parallel time: " << end_t - start_t << endl;
-    total_dump_time += (end_t - start_t);
-    // cout << "total_blks: " << total_blks << endl;
+    // ZNS requires each zone to be written strictly at its current write
+    // pointer. The old parallel writer could issue writes to the same zone out
+    // of order, so the correctness-preserving path uses the zone-serial writer.
+    dumpToZoneZoneSerial();
 }
 
 void dumpToZoneZoneSerial(void)
@@ -1752,6 +1693,7 @@ void dumpToZoneZoneSerial(void)
     }
 
     double start_t = get_current_time();
+    beginZNSEpoch();
     int next_zone = 0;
     for (int32_t vidx = 0; vidx < static_cast<int32_t>(global_vectex_vec.size()); vidx++) {
         Vertex *v = global_vectex_vec[vidx];
@@ -1789,6 +1731,7 @@ void dumpToZoneZoneSerial(void)
             }
         }
     }
+    commitZNSEpoch();
     double end_t = get_current_time();
     cout << "Dump to zone-serial writer time: " << end_t - start_t << endl;
     total_dump_time += (end_t - start_t);
@@ -1828,13 +1771,14 @@ void persist_cache_vertices_as_records(void)
         return;
     }
 
+    beginZNSEpoch();
     for (int32_t vidx = 0; vidx < static_cast<int32_t>(global_vectex_vec.size()); vidx++) {
         Vertex *v = global_vectex_vec[vidx];
         if (v->degree == 0 || !v->blk_list.empty()) {
             continue;
         }
 
-        pm_blk blk;
+        pm_blk blk{};
         blk.buf = new int32_t[PM_BLK_SIZE];
         fill(blk.buf, blk.buf + PM_BLK_SIZE, -1);
         for (int32_t i = 0; i < v->degree; i++) {
@@ -1855,12 +1799,76 @@ void persist_cache_vertices_as_records(void)
         v->blk_list[0].global_wp = wp;
         mark_zone(v->id, 0, wp);
     }
+    commitZNSEpoch();
 }
 
 struct RecoveredRecord {
     ZNSBlockHeader header;
     unsigned long long wp;
 };
+
+struct RecoveredEpochStats {
+    uint64_t first_seq = 0;
+    uint64_t last_seq = 0;
+    uint32_t data_record_count = 0;
+    uint32_t aggregate_checksum = 0;
+};
+
+static bool epoch_stats_match(const ZNSBlockHeader &commit,
+                              const RecoveredEpochStats &stats)
+{
+    return commit.first_seq == stats.first_seq &&
+           commit.last_seq == stats.last_seq &&
+           commit.data_record_count == stats.data_record_count &&
+           commit.aggregate_checksum == stats.aggregate_checksum;
+}
+
+static void ensure_recovered_vertex_capacity(int32_t vid)
+{
+    if (vid < 0) {
+        return;
+    }
+    if (static_cast<int32_t>(global_vectex_vec.size()) <= vid) {
+        int32_t old_size = static_cast<int32_t>(global_vectex_vec.size());
+        global_vectex_vec.resize(vid + 1, nullptr);
+        for (int32_t i = old_size; i <= vid; i++) {
+            Vertex *v = new Vertex(i);
+            v->pma = pma_creat();
+            global_vectex_vec[i] = v;
+        }
+    } else if (global_vectex_vec[vid] == nullptr) {
+        Vertex *v = new Vertex(vid);
+        v->pma = pma_creat();
+        global_vectex_vec[vid] = v;
+    }
+    global_max_vid = max(global_max_vid, vid);
+}
+
+static uint64_t replay_redo_logs_after(uint64_t committed_op_id,
+                                       const vector<EdgeLogRecord> &records)
+{
+    bool prev_replay_state = global_edge_log_replay_active;
+    global_edge_log_replay_active = true;
+    uint64_t replayed = 0;
+    for (const EdgeLogRecord &record : records) {
+        if (record.op_id <= committed_op_id) {
+            continue;
+        }
+        ensure_recovered_vertex_capacity(record.src);
+        ensure_recovered_vertex_capacity(record.dst);
+        if (record.op_type == EDGE_LOG_INSERT) {
+            graph_insert_directed_edge(record.src, record.dst);
+        } else if (record.op_type == EDGE_LOG_DELETE) {
+            graph_delete_directed_edge(record.src, record.dst);
+        }
+        global_last_applied_op_id = max(global_last_applied_op_id, record.op_id);
+        replayed++;
+    }
+    global_edge_log_replay_active = prev_replay_state;
+    cout << "Redo log replayed records: " << replayed
+         << " after committed_op_id: " << committed_op_id << endl;
+    return replayed;
+}
 
 void recover_graph_from_zns_records(void)
 {
@@ -1869,36 +1877,158 @@ void recover_graph_from_zns_records(void)
         exit(EXIT_FAILURE);
     }
 
+    unordered_map<uint64_t, ZNSBlockHeader> committed_epochs;
+    unordered_map<uint64_t, RecoveredEpochStats> observed_epoch_stats;
+    unordered_set<uint64_t> valid_epochs;
     unordered_map<uint64_t, RecoveredRecord> latest_records;
+    vector<EdgeLogRecord> redo_records;
     int32_t max_vid = -1;
     uint64_t max_seq = 0;
+    uint64_t max_epoch = 0;
+    uint64_t max_op_id = 0;
+    uint64_t meta_slots_scanned = 0;
+    uint64_t data_slots_scanned = 0;
+    uint64_t redo_slots_scanned = 0;
+    uint64_t commit_records_valid = 0;
+    uint64_t data_records_valid = 0;
+    uint64_t data_records_committed_epoch = 0;
+    uint64_t redo_records_valid = 0;
+    uint64_t rebuilt_vertices = 0;
+    uint64_t rebuilt_blocks = 0;
+    uint64_t rebuilt_edges = 0;
     double start_t = get_current_time();
 
+    if (global_meta_zone < 0) {
+        std::cerr << "ZNS-native recovery requires a metadata zone." << std::endl;
+        exit(EXIT_FAILURE);
+    }
+
+    unsigned long long meta_wp =
+        static_cast<unsigned long long>(global_meta_zone) *
+        static_cast<unsigned long long>(zns.zone_size);
+    for (int32_t blkidx = 0; blkidx < zns.nr_blocks_perzone; blkidx++) {
+        meta_slots_scanned++;
+        ZNSBlockHeader header;
+        if (readZNSRecordChecked(zns.dev_fd, header, nullptr, 0, meta_wp) &&
+            header.record_type == ZNS_RECORD_COMMIT) {
+            commit_records_valid++;
+            auto it = committed_epochs.find(header.epoch);
+            if (it == committed_epochs.end() || header.seq > it->second.seq) {
+                committed_epochs[header.epoch] = header;
+            }
+            max_seq = max(max_seq, header.seq);
+            max_epoch = max(max_epoch, header.epoch);
+            max_op_id = max(max_op_id, header.committed_op_id);
+            global_meta_wp = meta_wp + zns_alloc_unit_size();
+        }
+        meta_wp += zns_alloc_unit_size();
+    }
+
     for (int32_t zidx = 0; zidx < static_cast<int32_t>(zns.nr_zones); zidx++) {
+        if (zidx == global_meta_zone || zidx == global_redo_zone) {
+            continue;
+        }
         unsigned long long wp = static_cast<unsigned long long>(zidx) * zns.zone_size;
         for (int32_t blkidx = 0; blkidx < zns.nr_blocks_perzone; blkidx++) {
+            data_slots_scanned++;
             ZNSBlockHeader header;
-            if (!readZNSRecordHeader(zns.dev_fd, header, wp)) {
+            int32_t payload[PM_BLK_SIZE];
+            if (!readZNSRecordChecked(zns.dev_fd, header, payload, PM_BLK_SIZE, wp) ||
+                header.record_type != ZNS_RECORD_DATA) {
                 wp += zns_alloc_unit_size();
                 continue;
             }
-            int32_t *payload = nullptr;
-            readZNSRecordPayload(zns.dev_fd, payload, PM_BLK_SIZE, wp);
-            delete[] payload;
+
+            data_records_valid++;
+            max_seq = max(max_seq, header.seq);
+            max_epoch = max(max_epoch, header.epoch);
+            if (committed_epochs.find(header.epoch) != committed_epochs.end()) {
+                data_records_committed_epoch++;
+                RecoveredEpochStats &stats = observed_epoch_stats[header.epoch];
+                if (stats.data_record_count == 0) {
+                    stats.first_seq = header.seq;
+                    stats.last_seq = header.seq;
+                } else {
+                    stats.first_seq = min(stats.first_seq, header.seq);
+                    stats.last_seq = max(stats.last_seq, header.seq);
+                }
+                stats.data_record_count++;
+                stats.aggregate_checksum =
+                    combine_epoch_checksum(stats.aggregate_checksum,
+                                           header.seq,
+                                           header.checksum);
+            }
+            wp += zns_alloc_unit_size();
+        }
+    }
+
+    for (const auto &entry : committed_epochs) {
+        auto stats_it = observed_epoch_stats.find(entry.first);
+        if (stats_it != observed_epoch_stats.end() &&
+            epoch_stats_match(entry.second, stats_it->second)) {
+            valid_epochs.insert(entry.first);
+            global_committed_op_id =
+                max(global_committed_op_id, entry.second.committed_op_id);
+        }
+    }
+
+    if (global_redo_zone >= 0) {
+        unsigned long long redo_wp =
+            static_cast<unsigned long long>(global_redo_zone) *
+            static_cast<unsigned long long>(zns.zone_size);
+        for (int32_t blkidx = 0; blkidx < zns.nr_blocks_perzone; blkidx++) {
+            redo_slots_scanned++;
+            EdgeLogRecord record;
+            if (!readZNSRedoLogChecked(zns.dev_fd, record, redo_wp)) {
+                redo_wp += zns_alloc_unit_size();
+                continue;
+            }
+            redo_records_valid++;
+            redo_records.push_back(record);
+            max_op_id = max(max_op_id, record.op_id);
+            max_vid = max(max_vid, max(record.src, record.dst));
+            global_redo_wp = redo_wp + zns_alloc_unit_size();
+            redo_wp += zns_alloc_unit_size();
+        }
+        sort(redo_records.begin(), redo_records.end(),
+             [](const EdgeLogRecord &a, const EdgeLogRecord &b) {
+                 return a.op_id < b.op_id;
+             });
+    }
+
+    for (int32_t zidx = 0; zidx < static_cast<int32_t>(zns.nr_zones); zidx++) {
+        if (zidx == global_meta_zone || zidx == global_redo_zone) {
+            continue;
+        }
+        unsigned long long wp = static_cast<unsigned long long>(zidx) * zns.zone_size;
+        for (int32_t blkidx = 0; blkidx < zns.nr_blocks_perzone; blkidx++) {
+            ZNSBlockHeader header;
+            int32_t payload[PM_BLK_SIZE];
+            if (!readZNSRecordChecked(zns.dev_fd, header, payload, PM_BLK_SIZE, wp) ||
+                header.record_type != ZNS_RECORD_DATA ||
+                valid_epochs.find(header.epoch) == valid_epochs.end()) {
+                wp += zns_alloc_unit_size();
+                continue;
+            }
 
             uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(header.src_vid)) << 32) |
                            static_cast<uint32_t>(header.pma_blk_idx);
             auto it = latest_records.find(key);
-            if (it == latest_records.end() || header.seq > it->second.header.seq) {
+            if (it == latest_records.end() ||
+                header.epoch > it->second.header.epoch ||
+                (header.epoch == it->second.header.epoch &&
+                 header.seq > it->second.header.seq)) {
                 latest_records[key] = {header, wp};
             }
             max_vid = max(max_vid, header.src_vid);
-            max_seq = max(max_seq, header.seq);
             wp += zns_alloc_unit_size();
         }
     }
 
     global_zns_record_seq = max_seq + 1;
+    global_current_epoch = max_epoch + 1;
+    global_next_op_id = max_op_id + 1;
+    global_last_applied_op_id = global_committed_op_id;
     global_max_vid = max_vid;
     global_vectex_vec.clear();
     if (max_vid >= 0) {
@@ -1908,6 +2038,7 @@ void recover_graph_from_zns_records(void)
         Vertex *v = new Vertex(vid);
         v->pma = pma_creat();
         global_vectex_vec[vid] = v;
+        rebuilt_vertices++;
     }
 
     for (const auto &entry : latest_records) {
@@ -1924,15 +2055,47 @@ void recover_graph_from_zns_records(void)
         v->blk_list[blk_idx].buf = nullptr;
         v->blk_list[blk_idx].global_wp = record.wp;
         v->degree += record.header.valid_count;
+        rebuilt_edges += record.header.valid_count;
         v->pma->ele_num = max(v->pma->ele_num, static_cast<int32_t>(record.header.pma_ele));
         v->pma->arr_cap = max(v->pma->arr_cap, static_cast<int32_t>(record.header.pma_cap));
         mark_zone(vid, blk_idx, record.wp);
+        rebuilt_blocks++;
     }
+
+    // A COMMIT high-water mark is only sufficient when the checkpoint also
+    // covers cache-only vertices. Replaying the whole idempotent edge log is
+    // conservative and restores DRAM-only small-degree updates after crashes.
+    uint64_t redo_records_replayed = replay_redo_logs_after(0, redo_records);
 
     double end_t = get_current_time();
     cout << "ZNS-native recovery records: " << latest_records.size()
+         << " committed_epochs: " << committed_epochs.size()
+         << " valid_epochs: " << valid_epochs.size()
+         << " committed_op_id: " << global_committed_op_id
+         << " redo_records: " << redo_records.size()
          << " max_vid: " << global_max_vid
          << " time: " << (end_t - start_t) << endl;
+    cout << "ZNS recovery stats: "
+         << "meta_slots_scanned=" << meta_slots_scanned
+         << " commit_records_valid=" << commit_records_valid
+         << " committed_epochs=" << committed_epochs.size()
+         << " valid_epochs=" << valid_epochs.size()
+         << " data_slots_scanned=" << data_slots_scanned
+         << " data_records_valid=" << data_records_valid
+         << " data_records_committed_epoch=" << data_records_committed_epoch
+         << " latest_records=" << latest_records.size()
+         << " redo_slots_scanned=" << redo_slots_scanned
+         << " redo_records_valid=" << redo_records_valid
+         << " redo_records_replayed=" << redo_records_replayed
+         << " rebuilt_vertices=" << rebuilt_vertices
+         << " rebuilt_blocks=" << rebuilt_blocks
+         << " rebuilt_edges_before_redo=" << rebuilt_edges
+         << " committed_op_id=" << global_committed_op_id
+         << " max_seq=" << max_seq
+         << " max_epoch=" << max_epoch
+         << " max_op_id=" << max_op_id
+         << " recovery_time_sec=" << (end_t - start_t)
+         << endl;
 }
 
 // 恢复流程：先根据 zone 元数据恢复物理地址与度数，再尝试重建部分 PMA 状态。

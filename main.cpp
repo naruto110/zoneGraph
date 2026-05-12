@@ -53,6 +53,9 @@ static void print_usage(const char *program)
     cerr << "  --insert <src> <dst>: insert an undirected edge after build" << endl;
     cerr << "  --delete <src> <dst>: delete an undirected edge after insertion" << endl;
     cerr << "  --compact-delete: compact PMA layout after each PMA deletion" << endl;
+    cerr << "  --no-cache: disable cache_buf and route updates directly to PMA blocks" << endl;
+    cerr << "  --cache-threshold <n>: cache up to n neighbors per vertex before PMA migration (0-"
+         << CACHE_BLK_SIZE << ", default " << CACHE_BLK_SIZE << ")" << endl;
     cerr << "  --zone-writer: use zone-serial writer when flushing queued/parallel updates" << endl;
     cerr << "  --zone-class: place hot/cold/hub vertices into separate zone pools" << endl;
     cerr << "  --gc-global: use original global GC strategy (default)" << endl;
@@ -100,6 +103,23 @@ int main(int argc, char* argv[]) {
             print_pma = true;
         } else if (arg == "--compact-delete") {
             global_delete_compaction_enabled = true;
+        } else if (arg == "--no-cache") {
+            global_cache_buf_threshold = 0;
+        } else if (arg == "--cache-threshold") {
+            if (argi + 1 >= argc) {
+                cerr << "--cache-threshold requires <n>" << endl;
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            int threshold = 0;
+            if (!parse_int_arg(argv[argi + 1], threshold) ||
+                threshold < 0 || threshold > CACHE_BLK_SIZE) {
+                cerr << "Invalid cache threshold: " << argv[argi + 1] << endl;
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            global_cache_buf_threshold = threshold;
+            argi += 1;
         } else if (arg == "--zone-writer") {
             use_zone_writer = true;
         } else if (arg == "--zone-class") {

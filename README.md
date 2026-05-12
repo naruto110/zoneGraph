@@ -35,6 +35,26 @@ pm_blk.global_wp = record 起始地址
 
 不加 `--zns-record` 时，仍走旧路径。加 `--zns-record` 后才使用带 header 的 record 格式。
 
+record 模式下会预留三个特殊 zone：
+
+```text
+0 .. global_num_queues - 1: data zone，用于 DATA record
+global_empty_zone:         GC 搬迁使用的空白 zone
+global_redo_zone:          redo log zone，只追加边更新日志
+global_meta_zone:          metadata zone，只追加 COMMIT record
+```
+
+当前约定：
+
+```cpp
+global_meta_zone = zns.nr_zones - 1;
+global_redo_zone = zns.nr_zones - 2;
+global_empty_zone = zns.nr_zones - 3;
+global_num_queues = zns.nr_zones - 3;
+```
+
+因此 `--zns-record` 至少需要 4 个 zone：data、GC empty、redo log、metadata。
+
 ## 2. 主要文件
 
 `main.cpp`
@@ -62,6 +82,8 @@ ZNS 设备打开、zone 信息、块分配队列、底层读写、zone metadata 
 - `requestMemoryBlocks()`
 - `writeBlockToZone()` / `readBlockFromZone()`
 - `writeZNSRecord()` / `readZNSRecordPayload()`
+- `beginZNSEpoch()` / `commitZNSEpoch()`
+- `readZNSRecordChecked()`
 - `mark_zone()` / `invalidBlock()` / `test_block()`
 - `cacheBlock()`
 
@@ -108,7 +130,14 @@ Vertex::cache_buf[CACHE_BLK_SIZE]
 #define CACHE_BLK_SIZE 4
 ```
 
-这是为了让 `data.txt` 这样的小数据集也能触发刷写到 ZNS，便于验证。恢复实验中，`--zns-record` 会把 cache-only 顶点也持久化为 record，否则这些顶点不会出现在盘上。
+这是 `cache_buf` 的数组上限。运行时可以用参数调整实际缓存阈值：
+
+```bash
+--cache-threshold <0..4>
+--no-cache
+```
+
+`--no-cache` 等价于 `--cache-threshold 0`，顶点第一次插入就迁入 PMA 路径，适合作为无小度缓存的恢复/写放大对比实验。默认阈值仍为 4。恢复实验中，保守 redo 回放可以补齐 cache-only 顶点；如果关闭 cache，则 `committed_op_id` 的全图高水位语义更容易成立。
 
 ### 3.2 PMA block
 
@@ -156,6 +185,21 @@ readBlockFromZone(fd, payload, PM_BLK_SIZE, wp)
 
 这个路径用于和新增恢复方案对比。
 
+旧路径是不考虑 recovery 的 baseline：
+
+```text
+不写 ZNSBlockHeader
+不写 COMMIT record
+不写 redo log
+不预留 redo/meta zone
+```
+
+也就是说，普通运行命令不会产生 redo log：
+
+```bash
+sudo ./main_pma_check_new 0 1 parallel2
+```
+
 ### 4.2 新路径：ZNS record
 
 启用参数：
@@ -170,24 +214,38 @@ record 格式定义在 `global.h`：
 struct ZNSBlockHeader {
     uint32_t magic;
     uint32_t version;
+    uint32_t record_type;   // DATA 或 COMMIT
+    uint32_t payload_bytes;
+    uint64_t epoch;
     int32_t src_vid;
     int32_t pma_blk_idx;
     uint64_t seq;
+    uint64_t first_seq;     // COMMIT 使用
+    uint64_t last_seq;      // COMMIT 使用
+    uint32_t data_record_count;
+    uint32_t aggregate_checksum;
     uint32_t valid_count;
     uint32_t pma_ele;
     uint32_t pma_cap;
+    uint64_t committed_op_id; // COMMIT 使用
     uint32_t checksum;
+    uint32_t tail_magic;
 };
 ```
 
 写入时：
 
 ```text
+beginZNSEpoch()
 writeZNSRecord()
-  -> 生成 header
+  -> 生成 DATA header
+  -> 写入当前 epoch
   -> 计算 checksum
   -> 拼成 512B record
   -> pwrite(fd, record, 512, record_wp)
+commitZNSEpoch()
+  -> 向 metadata zone 追加 COMMIT record
+  -> COMMIT 记录 epoch、seq 范围、data record 数、汇总 checksum 和 committed_op_id
 ```
 
 读取时：
@@ -200,6 +258,52 @@ readZNSRecordPayload()
 ```
 
 record 路径下，`pm_blk.global_wp` 指向 record 起始地址，不是 payload 起始地址。
+
+record 路径是 recovery 版本。加 `--zns-record` 后才会启用 DATA/COMMIT record 和独立 redo log zone：
+
+```bash
+sudo ./main_pma_check_new 0 1 parallel2 --zns-record
+```
+
+恢复命令 `--recover-zns` 会自动打开 record/recovery 路径，但 redo replay 期间不会再次追加 redo log。
+
+### 4.3 Epoch Commit 事务边界
+
+record 模式下，一个 `dumpToZone*()` 或 `persist_cache_vertices_as_records()` 会被当成一个 epoch：
+
+```text
+beginZNSEpoch()
+  DATA epoch=N src=a blk=x
+  DATA epoch=N src=b blk=y
+  DATA epoch=N src=c blk=z
+commitZNSEpoch()
+  COMMIT epoch=N
+```
+
+DATA record 表示“某个顶点 PMA block 的一个版本”。COMMIT record 不属于任何顶点，只表示该 epoch 的 DATA record 已完整写入并可参与恢复。
+
+COMMIT record 写入最后一个 metadata zone，包含：
+
+```text
+epoch
+first_seq / last_seq
+data_record_count
+aggregate_checksum
+committed_op_id
+```
+
+`aggregate_checksum` 是顺序无关的，可以覆盖 DATA record 跨 zone 分布时物理扫描顺序和 seq 顺序不一致的情况。当前 `dumpToZoneParallel()` 为保证 ZNS zone 内顺序写，已收敛到 zone-serial writer；插入阶段仍可并行，物理写入阶段按 zone 顺序提交。
+
+恢复时只有通过以下条件的 epoch 才会生效：
+
+```text
+存在合法 COMMIT record
+DATA record 数量等于 data_record_count
+DATA seq 范围等于 first_seq / last_seq
+DATA checksum 汇总等于 aggregate_checksum
+```
+
+如果掉电发生在 COMMIT 写入前，或者 COMMIT / DATA 任一部分不完整导致校验不匹配，该 epoch 会被整体忽略。
 
 ## 5. Zone-Class 策略
 
@@ -292,22 +396,129 @@ zbd_reset_zones()
 
 ```text
 recover_graph_from_zns_records()
-  -> 顺序扫描所有 zone
-  -> 按 ZNS_RECORD_SIZE 读取 record
-  -> 校验 magic/version/checksum
+  -> 扫描 metadata zone，找合法 COMMIT record
+  -> 扫描 data zone，统计已提交 epoch 的 DATA record
+  -> 校验 data_record_count / aggregate_checksum / seq 范围
+  -> 只使用通过校验的 epoch
+  -> 得到最新 committed_op_id 高水位（当前仅用于统计和后续优化）
   -> key = (src_vid, pma_blk_idx)
-  -> 同一 key 保留 seq 最大的版本
+  -> 同一 key 保留已提交 epoch 中最新的版本
   -> 重建 global_vectex_vec
   -> 重建 v->blk_list[blk_idx].global_wp
   -> 重建 degree / pma_ele / pma_cap
   -> mark_zone()
+  -> 扫描 redo log zone
+  -> 保守顺序回放全量 redo log，重建未进入 ZNS 快照的 DRAM-only 小度顶点更新
+```
+
+恢复完成后会输出两类统计。第一行是概要：
+
+```text
+ZNS-native recovery records: <latest_records>
+  committed_epochs: <committed_epochs>
+  valid_epochs: <valid_epochs>
+  committed_op_id: <committed_op_id>
+  redo_records: <redo_records>
+  max_vid: <max_vid>
+  time: <seconds>
+```
+
+第二行是可用于实验分析的详细指标：
+
+```text
+ZNS recovery stats:
+  meta_slots_scanned=<n>
+  commit_records_valid=<n>
+  committed_epochs=<n>
+  valid_epochs=<n>
+  data_slots_scanned=<n>
+  data_records_valid=<n>
+  data_records_committed_epoch=<n>
+  latest_records=<n>
+  redo_slots_scanned=<n>
+  redo_records_valid=<n>
+  redo_records_replayed=<n>
+  rebuilt_vertices=<n>
+  rebuilt_blocks=<n>
+  rebuilt_edges_before_redo=<n>
+  committed_op_id=<n>
+  max_seq=<n>
+  max_epoch=<n>
+  max_op_id=<n>
+  recovery_time_sec=<seconds>
+```
+
+各项含义：
+
+```text
+meta_slots_scanned:
+  扫描 metadata zone 的 record slot 数，反映 metadata zone 扫描成本。
+
+commit_records_valid:
+  checksum/header 合法且类型为 COMMIT 的 record 数。
+
+committed_epochs:
+  metadata zone 中出现过的 epoch 数；同一 epoch 多条 COMMIT 时保留 seq 最大的一条。
+
+valid_epochs:
+  通过 COMMIT 校验的 epoch 数。只有这些 epoch 的 DATA record 会参与恢复。
+
+data_slots_scanned:
+  扫描 data zones 的 record slot 数，反映全盘 DATA 扫描成本。
+
+data_records_valid:
+  header/checksum 合法且类型为 DATA 的 record 数。
+
+data_records_committed_epoch:
+  属于已出现 COMMIT epoch 的 DATA record 数。之后还会用数量、seq 范围和 aggregate checksum 过滤出 valid epoch。
+
+latest_records:
+  按 (src_vid, pma_blk_idx) 去重后保留下来的最新 DATA record 数，也就是恢复快照中的有效块版本数。
+
+redo_slots_scanned:
+  扫描 redo log zone 的 record slot 数，反映 redo zone 扫描成本。
+
+redo_records_valid:
+  header/checksum 合法的 redo log record 数。
+
+redo_records_replayed:
+  实际回放的 redo log 数。当前为保守全量回放，主要用于补齐 cache-only 小度顶点更新。
+
+rebuilt_vertices:
+  恢复过程中重建的 Vertex 数。
+
+rebuilt_blocks:
+  从 latest_records 恢复出的 PMA/cache record 块数。
+
+rebuilt_edges_before_redo:
+  redo 回放前，仅由 ZNS DATA record 恢复出的邻边数量。
+
+committed_op_id:
+  COMMIT record 中记录的最大更新高水位。当前主要用于统计和后续 checkpoint 优化。
+
+max_seq:
+  扫描到的最大 ZNS DATA/COMMIT record 序号。
+
+max_epoch:
+  扫描到的最大 epoch。
+
+max_op_id:
+  扫描到的最大 redo log op_id。
+
+recovery_time_sec:
+  recover_graph_from_zns_records() 的总耗时。
 ```
 
 一致性语义：
 
 - 新版本写完整后，即使旧版本仍然在盘上，恢复时也会选择 `seq` 最大的 record。
-- 如果写入不完整或 checksum 不匹配，恢复时会忽略或报错。
-- 当前实现是第一版扫描恢复，还没有单独 metadata zone 或 checkpoint summary。
+- 掉电发生在 DATA record 写入过程中时，checksum/tail magic 不匹配的 record 会被恢复扫描忽略。
+- 掉电发生在一个 epoch 的 COMMIT 写入前时，该 epoch 的 DATA record 整批不会参与恢复。
+- 掉电发生在 COMMIT 完整写入后时，恢复会用 COMMIT 中的数量、seq 范围和汇总 checksum 验证该 epoch 是否完整。
+- redo log 使用独立预留 zone，当前恢复采用保守全量回放策略。
+- 由于小度顶点可能长期只存在 DRAM cache，只有在 checkpoint 明确持久化 cache-only 顶点后，`committed_op_id` 才能作为跳过 redo log 的安全高水位；当前实现采用保守策略，按顺序回放 redo log，利用 INSERT/DELETE 的幂等性保证正确性。
+- 当前实现已有 metadata zone 的 epoch commit，但还没有 checkpoint summary，恢复仍需要扫描 data zone。
+- `ZNS_BLOCK_VERSION` 当前为 3；旧版 record 不会被新版 `--recover-zns` 识别。
 
 ## 8. 命令行参数
 
@@ -333,6 +544,8 @@ parallel2
 --insert <src> <dst>
 --delete <src> <dst>
 --compact-delete
+--no-cache
+--cache-threshold <n>
 --zone-writer
 --zone-class
 --gc-global
@@ -362,6 +575,14 @@ make
 sudo ./main_pma_check_new 0 1 new --print-pma
 ```
 
+无 recovery baseline：
+
+```bash
+sudo ./main_pma_check_new 0 1 parallel2 --print-pma
+```
+
+该命令不写 redo log，也不会预留 redo/meta zone。
+
 zone-class 路径：
 
 ```bash
@@ -390,6 +611,38 @@ sudo ./main_pma_check_new 0 1 new --zns-record --print-pma
 sudo ./main_pma_check_new 0 1 --recover-zns --print-pma
 ```
 
+小度 cache 恢复对比实验：
+
+```bash
+# 方案 1：关闭 cache_buf，顶点第一次插入就进入 PMA/ZNS 路径
+sudo ./main_pma_check_new 0 1 parallel2 --zns-record --no-cache --print-pma
+sudo ./main_pma_check_new 0 1 --recover-zns --print-pma
+
+# 方案 2：保留默认小度 DRAM cache，依靠 redo log 保守回放补齐 cache-only 更新
+sudo ./main_pma_check_new 0 1 parallel2 --zns-record --print-pma
+sudo ./main_pma_check_new 0 1 --recover-zns --print-pma
+
+# 可选：显式设置 cache 阈值，0 等价于 --no-cache
+sudo ./main_pma_check_new 0 1 parallel2 --zns-record --cache-threshold 0 --print-pma
+sudo ./main_pma_check_new 0 1 parallel2 --zns-record --cache-threshold 4 --print-pma
+```
+
+两个方案的核心差异：
+
+```text
+方案 1 no-cache:
+  边更新 -> redo log -> PMA dirty block -> ZNS DATA record -> COMMIT
+  优点：恢复高水位语义简单，cache-only 丢失问题基本不存在
+  缺点：小度顶点更早占用 ZNS block，写放大和空间开销更高
+
+方案 2 cache + redo:
+  边更新 -> redo log -> cache_buf 或 PMA dirty block
+  cache-only 顶点可能不在 ZNS DATA record 中
+  恢复时：先恢复 ZNS 块级快照，再顺序回放 redo log
+  优点：减少小度顶点写放大
+  缺点：恢复需要更多 redo 查询/回放
+```
+
 ## 10. 当前创新点
 
 ### 10.1 小度顶点 DRAM cache + PMA 延迟刷盘
@@ -414,25 +667,29 @@ sudo ./main_pma_check_new 0 1 --recover-zns --print-pma
 
 ### 10.5 ZNS-native record 恢复
 
-每条持久化 record 自描述，恢复不依赖运行时 `global_zone_vec`。通过 `seq` 选择最新版本，为 crash consistency 提供基础。
+每条 DATA record 自描述，恢复不依赖运行时 `global_zone_vec`。record 模式下最后一个 zone 作为 metadata zone，批量写入完成后追加 COMMIT record。恢复只使用通过 COMMIT 校验的 epoch，再通过 `epoch/seq` 选择最新版本，为掉电恢复提供基本事务边界。
+
+### 10.6 独立 redo log zone + 保守回放
+
+record 模式下预留独立 redo log zone，边插入/删除先追加 `EdgeLogRecord`，再修改 DRAM 图结构。恢复时先恢复已提交的 ZNS 块级快照，再按 `op_id` 顺序回放 redo log。该设计覆盖 cache-only 小度顶点未写入 ZNS 的情况，同时支持 `--no-cache` 与默认 cache 策略的恢复开销/写放大对比。
 
 ## 11. 当前限制和注意事项
 
-1. `--recover-zns` 是第一版全盘扫描恢复，没有 checkpoint summary，盘大时会慢。
+1. `--recover-zns` 仍需要扫描 data zone，没有 checkpoint summary，盘大时会慢。
 2. `ZNS_RECORD_SIZE` 当前固定为 512B，payload 仍是 64 个 `int32_t`，剩余空间用于 header 和 padding。
-3. record 恢复目前重建的是 block 指针、degree 和 PMA 元数据，不会重新加载原 dataset。
+3. record 恢复目前重建的是 block 指针、degree 和 PMA 元数据，不会重新加载原 dataset；增量更新依赖 redo log zone。
 4. 旧路径和 record 路径的 `global_wp` 语义不同，新增代码必须通过 `zns_alloc_unit_size()` 和 record-aware 函数处理，不要手写 `ZONE_BLK_SIZE`。
 5. `--recover-zns` 不 reset zone；普通构图命令会 reset `/dev/nvme0n1`。
-6. 当前并行插入路径仍主要用于已有实验，后续若要做严格一致性实验，建议先以 `new` 串行路径验证。
+6. 当前 redo 恢复为了覆盖 cache-only 顶点采用全量回放；如果后续实现完整 cache checkpoint，可改为只回放 `op_id > committed_op_id`。
 7. GC 搬迁时需要始终更新顶点 `blk_list` 和 zone metadata，否则恢复和后续查询都会读到旧位置。
+8. record header 当前是 version 3，升级前写入的旧版 record 需要旧程序恢复，或后续补兼容读取逻辑。
 
 ## 12. 下次继续开发建议
 
 下一步可以优先做：
 
 1. 给 `--recover-zns` 增加更详细的统计输出：扫描 record 数、无效 header 数、checksum fail 数、每个 zone live record 数。
-2. 增加 `ZoneSummary` 或 metadata zone，避免每次恢复全盘扫描。
+2. 增加 `ZoneSummary`，避免每次恢复扫描全部 data zone。
 3. 增加 crash 模拟开关，例如写 header 后退出、写 payload 后退出，验证 checksum 和 seq 选择逻辑。
 4. 对 record 模式下 GC 后恢复做专项验证，确认搬迁后的 `seq` 和 `global_wp` 正确。
 5. 把 hot/cold/hub 阈值做成命令行参数，方便实验扫描。
-

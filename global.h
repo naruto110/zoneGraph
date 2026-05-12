@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <cstring>
 #include <unordered_map>
+#include <unordered_set>
 // #include <benchmark.h>
 
 using namespace std;
@@ -33,19 +34,53 @@ using namespace std;
 #define ZONE_BLK_SIZE (PM_BLK_SIZE * sizeof(int32_t))  // 一个逻辑块的字节数
 #define NVME_DEVICE_PATH "/dev/nvme0n1"
 #define ZNS_BLOCK_MAGIC 0x5A47504D
-#define ZNS_BLOCK_VERSION 1
+#define ZNS_BLOCK_VERSION 3
 #define ZNS_RECORD_SIZE 512
+#define ZNS_RECORD_TAIL_MAGIC 0x504D475A
+#define ZNS_REDO_MAGIC 0x5A475244
+#define ZNS_REDO_TAIL_MAGIC 0x4452475A
+
+enum ZNSRecordType : uint32_t {
+	ZNS_RECORD_DATA = 1,
+	ZNS_RECORD_COMMIT = 2
+};
+
+enum EdgeLogOpType : uint32_t {
+	EDGE_LOG_INSERT = 1,
+	EDGE_LOG_DELETE = 2
+};
 
 struct ZNSBlockHeader {
 	uint32_t magic;
 	uint32_t version;
+	uint32_t record_type;
+	uint32_t payload_bytes;
+	uint64_t epoch;
 	int32_t src_vid;
 	int32_t pma_blk_idx;
 	uint64_t seq;
+	uint64_t first_seq;
+	uint64_t last_seq;
+	uint32_t data_record_count;
+	uint32_t aggregate_checksum;
 	uint32_t valid_count;
 	uint32_t pma_ele;
 	uint32_t pma_cap;
+	uint64_t committed_op_id;
 	uint32_t checksum;
+	uint32_t tail_magic;
+};
+
+struct EdgeLogRecord {
+	uint32_t magic;
+	uint32_t version;
+	uint32_t op_type;
+	uint32_t reserved;
+	uint64_t op_id;
+	int32_t src;
+	int32_t dst;
+	uint32_t checksum;
+	uint32_t tail_magic;
 };
 
 static inline size_t zns_alloc_unit_size(void);
@@ -152,6 +187,22 @@ public:
 int nr_blocks_perzone = 0;
 bool global_zns_record_enabled = false;
 uint64_t global_zns_record_seq = 1;
+uint64_t global_current_epoch = 1;
+bool global_zns_epoch_active = false;
+uint64_t global_zns_epoch_first_seq = 0;
+uint64_t global_zns_epoch_last_seq = 0;
+uint32_t global_zns_epoch_data_count = 0;
+uint32_t global_zns_epoch_aggregate_checksum = 0;
+int32_t global_meta_zone = -1;
+unsigned long long global_meta_wp = 0;
+int32_t global_redo_zone = -1;
+unsigned long long global_redo_wp = 0;
+uint64_t global_next_op_id = 1;
+uint64_t global_last_applied_op_id = 0;
+uint64_t global_committed_op_id = 0;
+bool global_edge_log_replay_active = false;
+std::mutex global_zns_record_mutex;
+std::mutex global_redo_log_mutex;
 
 class MemoryWPQueue {
 public:
@@ -228,6 +279,7 @@ int32_t global_blk_id = 0;
 // int32_t global_cache_blk = 0;
 atomic<int> global_cache_blk(0);
 int32_t cache_blk_threshold = 1;
+int32_t global_cache_buf_threshold = CACHE_BLK_SIZE;
 int64_t global_edge_num = 0;
 int32_t global_max_vid = 0;
 vector<Vertex *> global_vectex_vec;

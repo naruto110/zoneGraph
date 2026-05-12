@@ -14,7 +14,13 @@ void readBlockFromZone(int fd, int32_t* &array, size_t size, unsigned long long 
 void writeBlockToZone(int fd, int32_t* array, size_t size, unsigned long long wp);
 void writeZNSRecord(int fd, int32_t src_vid, int32_t pma_blk_idx, PMA *pma,
                     int32_t *array, size_t size, unsigned long long wp);
+void beginZNSEpoch(void);
+void commitZNSEpoch(void);
+uint64_t appendZNSRedoLog(uint32_t op_type, int32_t src, int32_t dst);
 bool readZNSRecordHeader(int fd, ZNSBlockHeader &header, unsigned long long wp);
+bool readZNSRecordChecked(int fd, ZNSBlockHeader &header, int32_t* array,
+                          size_t size, unsigned long long wp);
+bool readZNSRedoLogChecked(int fd, EdgeLogRecord &record, unsigned long long wp);
 void readZNSRecordPayload(int fd, int32_t* &array, size_t size, unsigned long long wp);
 void writeGraphBlockToZone(Vertex *v, int32_t blk_idx, unsigned long long wp);
 void mark_zone(int32_t vid, int32_t blk_idx, unsigned long long wp);
@@ -94,8 +100,28 @@ int zns_open(void) {
 		return -1;
 	}
 	nr_blocks_perzone = zns.nr_blocks_perzone;
-	global_empty_zone = zns.info.nr_zones - 1;  // 默认把最后一个 zone 作为空白缓冲区
-	global_num_queues = zns.nr_zones - 1; // 其余 zone 用于分配可写块
+	if (global_zns_record_enabled) {
+		if (zns.info.nr_zones < 4) {
+			fprintf(stderr, "ZNS record mode requires at least 4 zones for data, GC, redo log, and metadata\n");
+			zns_close();
+			return -1;
+		}
+		global_meta_zone = zns.info.nr_zones - 1; // 最后一个 zone 专门追加 commit record
+		global_redo_zone = zns.info.nr_zones - 2; // 倒数第二个 zone 专门追加 redo log
+		global_empty_zone = zns.info.nr_zones - 3;  // 倒数第三个 zone 作为 GC 空白缓冲区
+		global_num_queues = zns.nr_zones - 3; // 其余 zone 用于 data record 分配
+		global_meta_wp = static_cast<unsigned long long>(global_meta_zone) *
+		                 static_cast<unsigned long long>(zns.zone_size);
+		global_redo_wp = static_cast<unsigned long long>(global_redo_zone) *
+		                 static_cast<unsigned long long>(zns.zone_size);
+	} else {
+		global_meta_zone = -1;
+		global_meta_wp = 0;
+		global_redo_zone = -1;
+		global_redo_wp = 0;
+		global_empty_zone = zns.info.nr_zones - 1;  // 默认把最后一个 zone 作为空白缓冲区
+		global_num_queues = zns.nr_zones - 1; // 其余 zone 用于分配可写块
+	}
 
 	int total_blks = zns.info.zone_size / zns_alloc_unit_size();
 
@@ -173,7 +199,8 @@ void garbage_collection() {
 
 	int32_t* array = new int32_t[PM_BLK_SIZE];
 	for (int zidx = 0; zidx < zns.nr_zones; zidx++) {
-		if (zidx == global_empty_zone || zidx == pre_empty_zone) {
+		if (zidx == global_empty_zone || zidx == pre_empty_zone ||
+		    zidx == global_meta_zone || zidx == global_redo_zone) {
 			continue;
 		}
 		wp = global_empty_zone * zns.zone_size;  // 空白 zone 起始位置
@@ -212,7 +239,7 @@ void garbage_collection() {
 		}
 		// 把空白 zone 剩余位置重新加入空闲块队列
 		for (int i = tmp_used_blk; i < zns.nr_blocks_perzone; i++) {
-			pm_blk blk;
+			pm_blk blk{};
 			blk.global_wp = wp;
 			blk.buf = nullptr;
 			graph_blk_que.push(blk);
@@ -245,7 +272,8 @@ void garbage_collection_new() {
 
 	int32_t* array = new int32_t[PM_BLK_SIZE];
 	for (int zidx = 0; zidx < zns.nr_zones; zidx++) {
-		if (zidx == global_empty_zone || zidx == pre_empty_zone) {
+		if (zidx == global_empty_zone || zidx == pre_empty_zone ||
+		    zidx == global_meta_zone || zidx == global_redo_zone) {
 			continue;
 		}
 		// cout << "global empty zone: " << global_empty_zone << " zns.zone_size: " << zns.zone_size << endl;
@@ -317,7 +345,7 @@ int generate_block_baseline(int blk_num) {
 			std::cerr << "No free baseline blocks before reserved empty zone." << std::endl;
 			exit(EXIT_FAILURE);
 		}
-		pm_blk blk;
+		pm_blk blk{};
 		blk.global_wp = global_blk_wp; // 记录该块在设备上的起始地址
 		// blk.blk_id = global_blk_id;
 		blk.buf = nullptr;
@@ -468,13 +496,28 @@ static uint32_t zns_record_checksum(const ZNSBlockHeader &header,
         hash ^= header_bytes[i];
         hash *= 16777619u;
     }
-    const unsigned char *payload_bytes =
-        reinterpret_cast<const unsigned char *>(array);
-    for (size_t i = 0; i < size * sizeof(int32_t); i++) {
-        hash ^= payload_bytes[i];
-        hash *= 16777619u;
+    if (array != nullptr && size > 0) {
+        const unsigned char *payload_bytes =
+            reinterpret_cast<const unsigned char *>(array);
+        for (size_t i = 0; i < size * sizeof(int32_t); i++) {
+            hash ^= payload_bytes[i];
+            hash *= 16777619u;
+        }
     }
     return hash;
+}
+
+static uint32_t combine_epoch_checksum(uint32_t aggregate,
+                                       uint64_t seq,
+                                       uint32_t checksum)
+{
+    uint32_t mixed = checksum;
+    mixed ^= static_cast<uint32_t>(seq) * 0x9e3779b9u;
+    mixed ^= static_cast<uint32_t>(seq >> 32) * 0x85ebca6bu;
+    mixed ^= mixed >> 16;
+    mixed *= 0x7feb352du;
+    mixed ^= mixed >> 15;
+    return aggregate ^ mixed;
 }
 
 static uint32_t count_payload_values(const int32_t *array, size_t size)
@@ -486,6 +529,70 @@ static uint32_t count_payload_values(const int32_t *array, size_t size)
         }
     }
     return count;
+}
+
+static uint32_t zns_redo_checksum(const EdgeLogRecord &record)
+{
+    uint32_t hash = 2166136261u;
+    EdgeLogRecord tmp = record;
+    tmp.checksum = 0;
+    const unsigned char *bytes =
+        reinterpret_cast<const unsigned char *>(&tmp);
+    for (size_t i = 0; i < sizeof(EdgeLogRecord); i++) {
+        hash ^= bytes[i];
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+uint64_t appendZNSRedoLog(uint32_t op_type, int32_t src, int32_t dst)
+{
+    if (!global_zns_record_enabled || global_edge_log_replay_active) {
+        return 0;
+    }
+    if (zns.dev_fd == -1) {
+        perror("Failed to open file for redo log writing");
+        exit(EXIT_FAILURE);
+    }
+    if (global_redo_zone < 0) {
+        std::cerr << "ZNS redo log requires a dedicated redo zone." << std::endl;
+        exit(EXIT_FAILURE);
+    }
+
+    EdgeLogRecord record;
+    unsigned long long wp = 0;
+    {
+        lock_guard<std::mutex> lock(global_redo_log_mutex);
+        if (global_redo_wp >=
+            (static_cast<unsigned long long>(global_redo_zone + 1) *
+             static_cast<unsigned long long>(zns.zone_size))) {
+            std::cerr << "No free space left in ZNS redo log zone." << std::endl;
+            exit(EXIT_FAILURE);
+        }
+
+        memset(&record, 0, sizeof(record));
+        record.magic = ZNS_REDO_MAGIC;
+        record.version = ZNS_BLOCK_VERSION;
+        record.op_type = op_type;
+        record.op_id = global_next_op_id++;
+        record.src = src;
+        record.dst = dst;
+        record.tail_magic = ZNS_REDO_TAIL_MAGIC;
+        record.checksum = zns_redo_checksum(record);
+
+        wp = global_redo_wp;
+        global_redo_wp += zns_alloc_unit_size();
+        global_last_applied_op_id = record.op_id;
+    }
+
+    char raw[ZNS_RECORD_SIZE];
+    memset(raw, 0, sizeof(raw));
+    memcpy(raw, &record, sizeof(record));
+    if (pwrite(zns.dev_fd, raw, ZNS_RECORD_SIZE, wp) != ZNS_RECORD_SIZE) {
+        perror("Failed to write ZNS redo log record");
+        exit(EXIT_FAILURE);
+    }
+    return record.op_id;
 }
 
 void writeZNSRecord(int fd, int32_t src_vid, int32_t pma_blk_idx, PMA *pma,
@@ -507,19 +614,117 @@ void writeZNSRecord(int fd, int32_t src_vid, int32_t pma_blk_idx, PMA *pma,
     memset(&header, 0, sizeof(header));
     header.magic = ZNS_BLOCK_MAGIC;
     header.version = ZNS_BLOCK_VERSION;
+    header.record_type = ZNS_RECORD_DATA;
+    header.payload_bytes = static_cast<uint32_t>(size * sizeof(int32_t));
     header.src_vid = src_vid;
     header.pma_blk_idx = pma_blk_idx;
-    header.seq = global_zns_record_seq++;
     header.valid_count = count_payload_values(array, size);
     header.pma_ele = pma == nullptr ? header.valid_count : static_cast<uint32_t>(pma->ele_num);
     header.pma_cap = pma == nullptr ? static_cast<uint32_t>(size) : static_cast<uint32_t>(pma->arr_cap);
-    header.checksum = zns_record_checksum(header, array, size);
+    header.tail_magic = ZNS_RECORD_TAIL_MAGIC;
+
+    {
+        lock_guard<std::mutex> lock(global_zns_record_mutex);
+        if (!global_zns_epoch_active) {
+            global_zns_epoch_active = true;
+            global_zns_epoch_first_seq = 0;
+            global_zns_epoch_last_seq = 0;
+            global_zns_epoch_data_count = 0;
+            global_zns_epoch_aggregate_checksum = 0;
+        }
+        header.epoch = global_current_epoch;
+        header.seq = global_zns_record_seq++;
+        header.checksum = zns_record_checksum(header, array, size);
+
+        if (global_zns_epoch_data_count == 0) {
+            global_zns_epoch_first_seq = header.seq;
+        }
+        global_zns_epoch_last_seq = header.seq;
+        global_zns_epoch_data_count++;
+        global_zns_epoch_aggregate_checksum =
+            combine_epoch_checksum(global_zns_epoch_aggregate_checksum,
+                                   header.seq,
+                                   header.checksum);
+    }
 
     memcpy(record, &header, sizeof(header));
     memcpy(record + sizeof(ZNSBlockHeader), array, size * sizeof(int32_t));
 
     if (pwrite(fd, record, ZNS_RECORD_SIZE, wp) != ZNS_RECORD_SIZE) {
         perror("Failed to write ZNS record");
+        exit(EXIT_FAILURE);
+    }
+}
+
+void beginZNSEpoch(void)
+{
+    if (!global_zns_record_enabled) {
+        return;
+    }
+    lock_guard<std::mutex> lock(global_zns_record_mutex);
+    if (global_zns_epoch_active) {
+        return;
+    }
+    global_zns_epoch_active = true;
+    global_zns_epoch_first_seq = 0;
+    global_zns_epoch_last_seq = 0;
+    global_zns_epoch_data_count = 0;
+    global_zns_epoch_aggregate_checksum = 0;
+}
+
+void commitZNSEpoch(void)
+{
+    if (!global_zns_record_enabled) {
+        return;
+    }
+
+    ZNSBlockHeader header;
+    memset(&header, 0, sizeof(header));
+    unsigned long long commit_wp = 0;
+    {
+        lock_guard<std::mutex> lock(global_zns_record_mutex);
+        if (!global_zns_epoch_active || global_zns_epoch_data_count == 0) {
+            global_zns_epoch_active = false;
+            return;
+        }
+        if (global_meta_zone < 0 || global_meta_wp >=
+            (static_cast<unsigned long long>(global_meta_zone + 1) *
+             static_cast<unsigned long long>(zns.zone_size))) {
+            std::cerr << "No free space left in ZNS metadata zone for commit record." << std::endl;
+            exit(EXIT_FAILURE);
+        }
+
+        header.magic = ZNS_BLOCK_MAGIC;
+        header.version = ZNS_BLOCK_VERSION;
+        header.record_type = ZNS_RECORD_COMMIT;
+        header.payload_bytes = 0;
+        header.epoch = global_current_epoch;
+        header.src_vid = -1;
+        header.pma_blk_idx = -1;
+        header.seq = global_zns_record_seq++;
+        header.first_seq = global_zns_epoch_first_seq;
+        header.last_seq = global_zns_epoch_last_seq;
+        header.data_record_count = global_zns_epoch_data_count;
+        header.aggregate_checksum = global_zns_epoch_aggregate_checksum;
+        header.committed_op_id = global_last_applied_op_id;
+        header.tail_magic = ZNS_RECORD_TAIL_MAGIC;
+        header.checksum = zns_record_checksum(header, nullptr, 0);
+
+        commit_wp = global_meta_wp;
+        global_meta_wp += zns_alloc_unit_size();
+        global_current_epoch++;
+        global_zns_epoch_active = false;
+        global_zns_epoch_first_seq = 0;
+        global_zns_epoch_last_seq = 0;
+        global_zns_epoch_data_count = 0;
+        global_zns_epoch_aggregate_checksum = 0;
+    }
+
+    char record[ZNS_RECORD_SIZE];
+    memset(record, 0, sizeof(record));
+    memcpy(record, &header, sizeof(header));
+    if (pwrite(zns.dev_fd, record, ZNS_RECORD_SIZE, commit_wp) != ZNS_RECORD_SIZE) {
+        perror("Failed to write ZNS commit record");
         exit(EXIT_FAILURE);
     }
 }
@@ -537,7 +742,61 @@ bool readZNSRecordHeader(int fd, ZNSBlockHeader &header, unsigned long long wp)
     }
     memcpy(&header, record, sizeof(ZNSBlockHeader));
     return header.magic == ZNS_BLOCK_MAGIC &&
-           header.version == ZNS_BLOCK_VERSION;
+           header.version == ZNS_BLOCK_VERSION &&
+           header.tail_magic == ZNS_RECORD_TAIL_MAGIC;
+}
+
+bool readZNSRecordChecked(int fd, ZNSBlockHeader &header, int32_t* array,
+                          size_t size, unsigned long long wp)
+{
+    if (fd == -1) {
+        perror("Failed to open file for ZNS record reading");
+        exit(EXIT_FAILURE);
+    }
+    char record[ZNS_RECORD_SIZE];
+    if (pread(fd, record, ZNS_RECORD_SIZE, wp) != ZNS_RECORD_SIZE) {
+        perror("Failed to read ZNS record");
+        exit(EXIT_FAILURE);
+    }
+    memcpy(&header, record, sizeof(ZNSBlockHeader));
+    if (header.magic != ZNS_BLOCK_MAGIC ||
+        header.version != ZNS_BLOCK_VERSION ||
+        header.tail_magic != ZNS_RECORD_TAIL_MAGIC) {
+        return false;
+    }
+    if (header.record_type == ZNS_RECORD_DATA) {
+        if (header.payload_bytes != size * sizeof(int32_t) || array == nullptr) {
+            return false;
+        }
+        memcpy(array, record + sizeof(ZNSBlockHeader), size * sizeof(int32_t));
+        return zns_record_checksum(header, array, size) == header.checksum;
+    }
+    if (header.record_type == ZNS_RECORD_COMMIT) {
+        return zns_record_checksum(header, nullptr, 0) == header.checksum;
+    }
+    return false;
+}
+
+bool readZNSRedoLogChecked(int fd, EdgeLogRecord &record, unsigned long long wp)
+{
+    if (fd == -1) {
+        perror("Failed to open file for redo log reading");
+        exit(EXIT_FAILURE);
+    }
+    char raw[ZNS_RECORD_SIZE];
+    if (pread(fd, raw, ZNS_RECORD_SIZE, wp) != ZNS_RECORD_SIZE) {
+        perror("Failed to read ZNS redo log record");
+        exit(EXIT_FAILURE);
+    }
+    memcpy(&record, raw, sizeof(EdgeLogRecord));
+    if (record.magic != ZNS_REDO_MAGIC ||
+        record.version != ZNS_BLOCK_VERSION ||
+        record.tail_magic != ZNS_REDO_TAIL_MAGIC ||
+        (record.op_type != EDGE_LOG_INSERT &&
+         record.op_type != EDGE_LOG_DELETE)) {
+        return false;
+    }
+    return zns_redo_checksum(record) == record.checksum;
 }
 
 void readZNSRecordPayload(int fd, int32_t* &array, size_t size, unsigned long long wp)
@@ -553,7 +812,11 @@ void readZNSRecordPayload(int fd, int32_t* &array, size_t size, unsigned long lo
     }
     ZNSBlockHeader header;
     memcpy(&header, record, sizeof(ZNSBlockHeader));
-    if (header.magic != ZNS_BLOCK_MAGIC || header.version != ZNS_BLOCK_VERSION) {
+    if (header.magic != ZNS_BLOCK_MAGIC ||
+        header.version != ZNS_BLOCK_VERSION ||
+        header.record_type != ZNS_RECORD_DATA ||
+        header.payload_bytes != size * sizeof(int32_t) ||
+        header.tail_magic != ZNS_RECORD_TAIL_MAGIC) {
         std::cerr << "Invalid ZNS record header at wp=" << wp << std::endl;
         exit(EXIT_FAILURE);
     }
