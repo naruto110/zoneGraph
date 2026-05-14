@@ -24,6 +24,10 @@ static const uint8_t max_sparseness =  2; // 1 / p_0;
 // #define PM_BLK_SIZE (32 * BLK_SCALE)  // 每块的元素数可在实验中调整
 
 PMA* pma_creat (void);
+static void refresh_loaded_block_meta(Vertex *v);
+static void refresh_block_meta_range(Vertex *v, int32_t start_blk, int32_t end_blk);
+static int32_t find_prev_valid_index(Vertex *src, int32_t from, int32_t index,
+                                     vector<int32_t> &release_blk_vec);
 static void compute_capacity (PMA* pma);
 int32_t binary_pma_find(PMA* pma, Vertex *src, int32_t des, int32_t from, int32_t to);
 int32_t pma_insert(PMA* pma, Vertex *src, int32_t des, int32_t index);
@@ -83,6 +87,67 @@ PMA* pma_creat (void)
     // pma->array = (element_type *)memkind_malloc(kind, sizeof(element_type) * pma->arr_cap);  // on NVM
     // pma->row_offset = (vertexOff *)malloc(sizeof(vertexOff) * pma->vertex_cap); // on DRAM
     return (pma);
+}
+
+static void refresh_loaded_block_meta(Vertex *v)
+{
+    for (int32_t blk_idx = 0; blk_idx < static_cast<int32_t>(v->blk_list.size()); blk_idx++) {
+        if (v->blk_list[blk_idx].buf != nullptr) {
+            refresh_pm_blk_meta(v->blk_list[blk_idx], v->blk_list[blk_idx].buf);
+        }
+    }
+}
+
+static void refresh_block_meta_range(Vertex *v, int32_t start_blk, int32_t end_blk)
+{
+    if (v->blk_list.empty()) {
+        return;
+    }
+    start_blk = max(start_blk, 0);
+    end_blk = min(end_blk, static_cast<int32_t>(v->blk_list.size()) - 1);
+    for (int32_t blk_idx = start_blk; blk_idx <= end_blk; blk_idx++) {
+        if (v->blk_list[blk_idx].buf != nullptr) {
+            refresh_pm_blk_meta(v->blk_list[blk_idx], v->blk_list[blk_idx].buf);
+        }
+    }
+}
+
+static int32_t find_prev_valid_index(Vertex *src, int32_t from, int32_t index,
+                                     vector<int32_t> &release_blk_vec)
+{
+    while (index >= from) {
+        int32_t blk_idx = index / PM_BLK_SIZE;
+        int32_t bit_idx = index % PM_BLK_SIZE;
+        if (blk_idx < 0 || blk_idx >= static_cast<int32_t>(src->blk_list.size())) {
+            return -1;
+        }
+
+        pm_blk &blk = src->blk_list[blk_idx];
+        if (blk.valid_count == 0) {
+            index = blk_idx * PM_BLK_SIZE - 1;
+            continue;
+        }
+
+        if (blk.buf == nullptr) {
+            readBlockFromZone(zns.dev_fd, blk.buf, PM_BLK_SIZE, blk.global_wp);
+            refresh_pm_blk_meta(blk, blk.buf);
+            release_blk_vec.push_back(blk_idx);
+        }
+
+        uint64_t mask = blk.valid_bitmap;
+        if (bit_idx < PM_BLK_SIZE - 1) {
+            mask &= ((1ULL << (bit_idx + 1)) - 1ULL);
+        }
+        if (from / PM_BLK_SIZE == blk_idx) {
+            int32_t from_bit = from % PM_BLK_SIZE;
+            mask &= (~0ULL << from_bit);
+        }
+        if (mask != 0) {
+            return blk_idx * PM_BLK_SIZE + (63 - __builtin_clzll(mask));
+        }
+        index = blk_idx * PM_BLK_SIZE - 1;
+    }
+    return -1;
 }
 
 // 根据当前元素数重新计算 PMA 容量和段长。
@@ -169,36 +234,13 @@ int32_t binary_pma_find(PMA* pma, Vertex *src, int32_t des, int32_t from, int32_
 
     while (from <= to) {
         int32_t mid = from + (to - from) / 2;
-        int32_t i = mid;
-        /* Start scanning left until we find a non-empty slot or we reach past the
-        * beginning of the subarray. */
-        blk_idx = i / PM_BLK_SIZE;
-        bit_idx = i % PM_BLK_SIZE;
-
-        if (src->blk_list[blk_idx].buf == nullptr) {
-            readBlockFromZone(zns.dev_fd, src->blk_list[blk_idx].buf, PM_BLK_SIZE, src->blk_list[blk_idx].global_wp); // 从设备读入一个块
-            release_blk_vec.push_back(blk_idx);
-        }
-        
-        // cur_blk = blk_idx;
-        // while (i >= from && (src->blk_list[blk_idx].blk_ptr[bit_idx] < 0)){
-        while (i >= from && (src->blk_list[blk_idx].buf[bit_idx] < 0)){
-            i--;
-            if (i < from) {
-                break;
-            }
-            blk_idx = i / PM_BLK_SIZE;
-            bit_idx = i % PM_BLK_SIZE;
-            // 跨块后按需把对应块换入内存
-            if (src->blk_list[blk_idx].buf == nullptr) {
-                readBlockFromZone(zns.dev_fd, src->blk_list[blk_idx].buf, PM_BLK_SIZE, src->blk_list[blk_idx].global_wp); // 从设备读入一个块
-                release_blk_vec.push_back(blk_idx);
-            }
-        }
+        int32_t i = find_prev_valid_index(src, from, mid, release_blk_vec);
 
         if (i < from) {  /* Everything between from and mid (inclusive) is empty. */
             from = mid + 1;
         } else {
+            blk_idx = i / PM_BLK_SIZE;
+            bit_idx = i % PM_BLK_SIZE;
             // if (src->blk_list[blk_idx].blk_ptr[bit_idx] == des) {
             if (src->blk_list[blk_idx].buf[bit_idx] == des) {
                 index = i;
@@ -226,31 +268,7 @@ int32_t binary_pma_find(PMA* pma, Vertex *src, int32_t des, int32_t from, int32_
         return -1;
     }
 
-    blk_idx = index / PM_BLK_SIZE;
-    bit_idx = index % PM_BLK_SIZE;
-
-    if (src->blk_list[blk_idx].buf == nullptr) {
-        readBlockFromZone(zns.dev_fd, src->blk_list[blk_idx].buf, PM_BLK_SIZE, src->blk_list[blk_idx].global_wp); // 从设备读入一个块
-        release_blk_vec.push_back(blk_idx);
-    }
-
-    // readBlockFromZone(zns.dev_fd, tmp_blk_ptr, PM_BLK_SIZE, src->blk_list[blk_idx].global_wp);
-
-    // cur_blk = blk_idx;
-    while (index >= 0 && (src->blk_list[blk_idx].buf[bit_idx] < 0)) {
-        index--;  // 跳过空洞，确保找到真实前驱
-        if (index < 0) {
-            break;
-        }
-        blk_idx = index / PM_BLK_SIZE;
-        bit_idx = index % PM_BLK_SIZE;
-        // 跨块后按需把对应块换入内存
-
-        if (src->blk_list[blk_idx].buf == nullptr) {
-            readBlockFromZone(zns.dev_fd, src->blk_list[blk_idx].buf, PM_BLK_SIZE, src->blk_list[blk_idx].global_wp); // 从设备读入一个块
-            release_blk_vec.push_back(blk_idx);
-        }
-    }
+    index = find_prev_valid_index(src, 0, index, release_blk_vec);
 
     for (int jj = 0; jj < release_blk_vec.size(); jj++) {
         delete[] src->blk_list[release_blk_vec[jj]].buf;
@@ -274,36 +292,13 @@ int32_t binary_pma_find_recovery(PMA* pma, Vertex *src, int32_t des, int32_t fro
 
     while (from <= to) {
         int32_t mid = from + (to - from) / 2;
-        int32_t i = mid;
-        /* Start scanning left until we find a non-empty slot or we reach past the
-        * beginning of the subarray. */
-        blk_idx = i / PM_BLK_SIZE;
-        bit_idx = i % PM_BLK_SIZE;
-
-        if (src->blk_list[blk_idx].buf == nullptr) {
-            readBlockFromZone(zns.dev_fd, src->blk_list[blk_idx].buf, PM_BLK_SIZE, src->blk_list[blk_idx].global_wp); // 从设备读入一个块
-            release_blk_vec.push_back(blk_idx);
-        }
-        
-        // cur_blk = blk_idx;
-        // while (i >= from && (src->blk_list[blk_idx].blk_ptr[bit_idx] < 0)){
-        while (i >= from && (src->blk_list[blk_idx].buf[bit_idx] < 0)){
-            i--;
-            if (i < from) {
-                break;
-            }
-            blk_idx = i / PM_BLK_SIZE;
-            bit_idx = i % PM_BLK_SIZE;
-            // 跨块后按需把对应块换入内存
-            if (src->blk_list[blk_idx].buf == nullptr) {
-                readBlockFromZone(zns.dev_fd, src->blk_list[blk_idx].buf, PM_BLK_SIZE, src->blk_list[blk_idx].global_wp); // 从设备读入一个块
-                release_blk_vec.push_back(blk_idx);
-            }
-        }
+        int32_t i = find_prev_valid_index(src, from, mid, release_blk_vec);
 
         if (i < from) {  /* Everything between from and mid (inclusive) is empty. */
             from = mid + 1;
         } else {
+            blk_idx = i / PM_BLK_SIZE;
+            bit_idx = i % PM_BLK_SIZE;
             // if (src->blk_list[blk_idx].blk_ptr[bit_idx] == des) {
             if (src->blk_list[blk_idx].buf[bit_idx] == des) {
                 index = i;
@@ -331,31 +326,7 @@ int32_t binary_pma_find_recovery(PMA* pma, Vertex *src, int32_t des, int32_t fro
         return -1;
     }
 
-    blk_idx = index / PM_BLK_SIZE;
-    bit_idx = index % PM_BLK_SIZE;
-
-    if (src->blk_list[blk_idx].buf == nullptr) {
-        readBlockFromZone(zns.dev_fd, src->blk_list[blk_idx].buf, PM_BLK_SIZE, src->blk_list[blk_idx].global_wp); // 从设备读入一个块
-        release_blk_vec.push_back(blk_idx);
-    }
-
-    // readBlockFromZone(zns.dev_fd, tmp_blk_ptr, PM_BLK_SIZE, src->blk_list[blk_idx].global_wp);
-
-    // cur_blk = blk_idx;
-    while (index >= 0 && (src->blk_list[blk_idx].buf[bit_idx] < 0)) {
-        index--;  // 跳过空洞，确保找到真实前驱
-        if (index < 0) {
-            break;
-        }
-        blk_idx = index / PM_BLK_SIZE;
-        bit_idx = index % PM_BLK_SIZE;
-        // 跨块后按需把对应块换入内存
-
-        if (src->blk_list[blk_idx].buf == nullptr) {
-            readBlockFromZone(zns.dev_fd, src->blk_list[blk_idx].buf, PM_BLK_SIZE, src->blk_list[blk_idx].global_wp); // 从设备读入一个块
-            release_blk_vec.push_back(blk_idx);
-        }
-    }
+    index = find_prev_valid_index(src, 0, index, release_blk_vec);
 
     for (int jj = 0; jj < release_blk_vec.size(); jj++) {
         delete[] src->blk_list[release_blk_vec[jj]].buf;
@@ -492,6 +463,7 @@ int32_t pma_insert(PMA* pma, Vertex *src, int32_t des, int32_t index)
     // cout << "test---before rebalance" << endl;
     
     rebalance(pma, src, inserted_index);
+    refresh_loaded_block_meta(src);
 
     return inserted_index;
 }
@@ -517,6 +489,8 @@ bool pma_delete(PMA *pma, Vertex *src, int32_t des)
     src->degree--;
     if (global_delete_compaction_enabled) {
         pma_compact(pma, src);
+    } else {
+        refresh_pm_blk_meta(src->blk_list[blk_idx], src->blk_list[blk_idx].buf);
     }
     return true;
 }
@@ -548,6 +522,7 @@ void pma_compact(PMA *pma, Vertex *src)
     }
 
     if (values.empty()) {
+        refresh_loaded_block_meta(src);
         return;
     }
 
@@ -561,6 +536,7 @@ void pma_compact(PMA *pma, Vertex *src)
         src->blk_list[blk_idx].buf[bit_idx] = values[ridx];
         write_index -= frequency;
     }
+    refresh_loaded_block_meta(src);
 }
 
 
@@ -665,6 +641,7 @@ void spread (PMA* pma, Vertex *src, int32_t from, int32_t to, int32_t occupancy)
         }
         // 将均匀铺开的结果写回块缓存
         memcpy(&src->blk_list[start_blk].buf[from], tmp_win_arr, sizeof(int32_t) * capacity);
+        refresh_pm_blk_meta(src->blk_list[start_blk], src->blk_list[start_blk].buf);
         // 下面是旧版本中“立即写回设备”的思路，当前改为统一刷盘
         // if (graph_blk_que.size() == 0) {
         //     generate_block_baseline(100);
@@ -754,6 +731,7 @@ void spread (PMA* pma, Vertex *src, int32_t from, int32_t to, int32_t occupancy)
                 cpy_size = PM_BLK_SIZE;
             }
         }
+        refresh_block_meta_range(src, start_blk, end_blk);
     }
     free(tmp_win_arr);
     delete[] tmp_blk_ptr;
@@ -803,6 +781,7 @@ void resize (PMA* pma, Vertex *src)
     }
 
     if (values.empty()) {
+        refresh_loaded_block_meta(src);
         return;
     }
 
@@ -817,6 +796,7 @@ void resize (PMA* pma, Vertex *src)
         src->blk_list[blk_idx].buf[bit_idx] = values[ridx];
         write_index -= frequency;
     }
+    refresh_loaded_block_meta(src);
 }
 
 // 读取边文件。当前按无向图处理，因此每条边会被双向展开。
@@ -1259,6 +1239,7 @@ static bool garbageCollectVictimZone(int32_t victim_zone)
             }
 
             readBlockFromZone(zns.dev_fd, array, PM_BLK_SIZE, rp);
+            refresh_pm_blk_meta(v->blk_list[info.blkIndex], array);
             if (global_zns_record_enabled) {
                 writeZNSRecord(zns.dev_fd, info.src, info.blkIndex, v->pma, array, PM_BLK_SIZE, new_wp);
             } else {
@@ -1634,6 +1615,7 @@ void dumpToZone(void)
     beginZNSEpoch();
     for (int32_t vidx = 0; vidx < global_vectex_vec.size(); vidx++) {
         Vertex *v = global_vectex_vec[vidx];
+        unique_lock<std::shared_timed_mutex> lock(v->mutex);
         // cout << "dump vid: " << v->id << " degree: " << v->degree << " blks: " << v->blk_list.size() << endl;
         if ((v->degree > 0) && (v->blk_list.size() > 0)) {
             for (int blkidx = 0; blkidx < v->blk_list.size(); blkidx++) {
@@ -1658,6 +1640,11 @@ void dumpToZone(void)
                     graph_blk_que.pop();
                 }
 
+                refresh_pm_blk_meta(v->blk_list[blkidx], v->blk_list[blkidx].buf);
+                new_blk.min_val = v->blk_list[blkidx].min_val;
+                new_blk.max_val = v->blk_list[blkidx].max_val;
+                new_blk.valid_count = v->blk_list[blkidx].valid_count;
+                new_blk.valid_bitmap = v->blk_list[blkidx].valid_bitmap;
                 writeGraphBlockToZone(v, blkidx, new_blk.global_wp);
                 delete[] v->blk_list[blkidx].buf;
                 mark_zone(v->id, blkidx, new_blk.global_wp);  // 更新块映射，供 GC 使用
@@ -1697,6 +1684,7 @@ void dumpToZoneZoneSerial(void)
     int next_zone = 0;
     for (int32_t vidx = 0; vidx < static_cast<int32_t>(global_vectex_vec.size()); vidx++) {
         Vertex *v = global_vectex_vec[vidx];
+        unique_lock<std::shared_timed_mutex> lock(v->mutex);
         if ((v->degree > 0) && (v->blk_list.size() > 0)) {
             for (int blkidx = 0; blkidx < static_cast<int32_t>(v->blk_list.size()); blkidx++) {
                 if (v->blk_list[blkidx].buf == nullptr) {
@@ -1722,6 +1710,7 @@ void dumpToZoneZoneSerial(void)
                     exit(EXIT_FAILURE);
                 }
 
+                refresh_pm_blk_meta(v->blk_list[blkidx], v->blk_list[blkidx].buf);
                 writeGraphBlockToZone(v, blkidx, wp);
                 delete[] v->blk_list[blkidx].buf;
                 mark_zone(v->id, blkidx, wp);
@@ -1774,6 +1763,7 @@ void persist_cache_vertices_as_records(void)
     beginZNSEpoch();
     for (int32_t vidx = 0; vidx < static_cast<int32_t>(global_vectex_vec.size()); vidx++) {
         Vertex *v = global_vectex_vec[vidx];
+        unique_lock<std::shared_timed_mutex> lock(v->mutex);
         if (v->degree == 0 || !v->blk_list.empty()) {
             continue;
         }
@@ -1784,6 +1774,7 @@ void persist_cache_vertices_as_records(void)
         for (int32_t i = 0; i < v->degree; i++) {
             blk.buf[i] = v->cache_buf[i];
         }
+        refresh_pm_blk_meta(blk, blk.buf);
         v->blk_list.push_back(blk);
         v->pma->ele_num = v->degree;
         v->pma->arr_cap = max(v->pma->arr_cap, CACHE_BLK_SIZE);
@@ -2054,6 +2045,14 @@ void recover_graph_from_zns_records(void)
         }
         v->blk_list[blk_idx].buf = nullptr;
         v->blk_list[blk_idx].global_wp = record.wp;
+        ZNSBlockHeader checked_header;
+        int32_t payload[PM_BLK_SIZE];
+        if (readZNSRecordChecked(zns.dev_fd, checked_header, payload, PM_BLK_SIZE, record.wp) &&
+            checked_header.record_type == ZNS_RECORD_DATA) {
+            refresh_pm_blk_meta(v->blk_list[blk_idx], payload);
+        } else {
+            reset_pm_blk_meta(v->blk_list[blk_idx]);
+        }
         v->degree += record.header.valid_count;
         rebuilt_edges += record.header.valid_count;
         v->pma->ele_num = max(v->pma->ele_num, static_cast<int32_t>(record.header.pma_ele));
@@ -2115,8 +2114,10 @@ void graph_recovery(void)
                 //     cout << "error test: " << global_zone_vec[zidx]->blk_info_vec[blkidx].status << endl;
                 // }
                 // cout << "ori wp: " << v->blk_list[global_zone_vec[zidx]->blk_info_vec[blkidx].blkIndex].global_wp << " cur wp: " << wp << endl;
-                v->blk_list[global_zone_vec[zidx]->blk_info_vec[blkidx].blkIndex].global_wp = wp;
+                int32_t logical_blk_idx = global_zone_vec[zidx]->blk_info_vec[blkidx].blkIndex;
+                v->blk_list[logical_blk_idx].global_wp = wp;
                 readBlockFromZone(zns.dev_fd, tmp_blk_ptr, PM_BLK_SIZE, wp);
+                refresh_pm_blk_meta(v->blk_list[logical_blk_idx], tmp_blk_ptr);
                 for (int j=0; j < PM_BLK_SIZE; j++) {
                     if (tmp_blk_ptr[j] >= 0){
                         v->degree++;

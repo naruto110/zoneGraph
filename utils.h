@@ -11,6 +11,7 @@ using namespace std;
 
 bool test_block(int zone_idx, int blk_idx);
 void readBlockFromZone(int fd, int32_t* &array, size_t size, unsigned long long wp);
+void readBlockFromZoneInto(int fd, int32_t* array, size_t size, unsigned long long wp);
 void writeBlockToZone(int fd, int32_t* array, size_t size, unsigned long long wp);
 void writeZNSRecord(int fd, int32_t src_vid, int32_t pma_blk_idx, PMA *pma,
                     int32_t *array, size_t size, unsigned long long wp);
@@ -228,7 +229,9 @@ void garbage_collection() {
 				} else {
 					writeBlockToZone(zns.dev_fd, array, PM_BLK_SIZE, wp);
 				}
+				refresh_pm_blk_meta(v->blk_list[ori_blk_idx], array);
 				v->blk_list[ori_blk_idx].global_wp = wp; // 新块已写入设备，因此对应 buf 应保持为空
+				v->blk_list[ori_blk_idx].buf = nullptr;
 				global_zone_vec[zidx]->blk_info_vec[blkidx].status = false; // 原块失效
 				// 标记新位置的映射关系
 				mark_zone(vid, ori_blk_idx, wp);
@@ -303,7 +306,9 @@ void garbage_collection_new() {
 				} else {
 					writeBlockToZone(zns.dev_fd, array, PM_BLK_SIZE, wp);
 				}
+				refresh_pm_blk_meta(v->blk_list[ori_blk_idx], array);
 				v->blk_list[ori_blk_idx].global_wp = wp; // 新块已写入设备，因此对应 buf 应保持为空
+				v->blk_list[ori_blk_idx].buf = nullptr;
 				global_zone_vec[zidx]->blk_info_vec[blkidx].status = false; // 原块失效
 				// 标记新位置的映射关系
 				mark_zone(vid, ori_blk_idx, wp);
@@ -481,6 +486,27 @@ void readBlockFromZone(int fd, int32_t* &array, size_t size, unsigned long long 
     }
 
     // close(fd);
+}
+
+void readBlockFromZoneInto(int fd, int32_t* array, size_t size, unsigned long long wp) {
+	if (array == nullptr) {
+		std::cerr << "readBlockFromZoneInto requires a caller-owned buffer." << std::endl;
+		exit(EXIT_FAILURE);
+	}
+	if (global_zns_record_enabled) {
+		int32_t *array_ref = array;
+		readZNSRecordPayload(fd, array_ref, size, wp);
+		return;
+	}
+	if (fd == -1) {
+		perror("Failed to open file for reading");
+		exit(EXIT_FAILURE);
+	}
+	size_t bytesToRead = size * sizeof(int32_t);
+	if (pread(fd, array, bytesToRead, wp) != bytesToRead) {
+		perror("Failed to read data");
+		exit(EXIT_FAILURE);
+	}
 }
 
 static uint32_t zns_record_checksum(const ZNSBlockHeader &header,
@@ -883,6 +909,7 @@ void cacheBlock(Vertex *v, int32_t blk_idx)
 {
 	v->blk_list[blk_idx].buf = new int32_t[PM_BLK_SIZE]; // 为块缓存分配 DRAM
 	readBlockFromZone(zns.dev_fd, v->blk_list[blk_idx].buf, PM_BLK_SIZE, v->blk_list[blk_idx].global_wp); // 从设备读入该块
+	refresh_pm_blk_meta(v->blk_list[blk_idx], v->blk_list[blk_idx].buf);
 	invalidBlock(v->blk_list[blk_idx].global_wp); // 读回后旧物理位置不再视作当前有效版本
 	global_cache_blk++;
 }

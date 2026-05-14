@@ -22,6 +22,7 @@
 #include <atomic>
 #include <random>
 #include <cstdint>
+#include <climits>
 #include <cstring>
 #include <unordered_map>
 #include <unordered_set>
@@ -105,12 +106,40 @@ typedef struct pma_blk
 	// int32_t blk_id;
 	// int zone_idx;
 	// unsigned long long local_wp;
-	unsigned long long global_wp; // 该块在设备上的全局偏移
+	unsigned long long global_wp = 0; // 该块在设备上的全局偏移
 
 	// int32_t src;
 	// int32_t blk_idx;
-	int32_t *buf; // DRAM 中的块缓存；非空表示该块当前已换入内存
+	int32_t *buf = nullptr; // DRAM 中的块缓存；非空表示该块当前已换入内存
+	int32_t min_val = INT32_MAX; // 当前块内有效邻居最小值，仅内存态
+	int32_t max_val = INT32_MIN; // 当前块内有效邻居最大值，仅内存态
+	int32_t valid_count = 0; // 当前块内非 -1 slot 数
+	uint64_t valid_bitmap = 0; // bit i 表示 buf[i] 或持久化 payload[i] 有效
 } pm_blk;
+
+static inline void reset_pm_blk_meta(pm_blk &blk)
+{
+	blk.min_val = INT32_MAX;
+	blk.max_val = INT32_MIN;
+	blk.valid_count = 0;
+	blk.valid_bitmap = 0;
+}
+
+static inline void refresh_pm_blk_meta(pm_blk &blk, const int32_t *data)
+{
+	reset_pm_blk_meta(blk);
+	if (data == nullptr) {
+		return;
+	}
+	for (int32_t i = 0; i < PM_BLK_SIZE; i++) {
+		if (data[i] >= 0) {
+			blk.valid_bitmap |= (1ULL << i);
+			blk.valid_count++;
+			blk.min_val = min(blk.min_val, data[i]);
+			blk.max_val = max(blk.max_val, data[i]);
+		}
+	}
+}
 
 typedef struct new_edge
 {

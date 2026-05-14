@@ -18,6 +18,44 @@ using namespace std;
 typedef float ScoreT;
 const float kDamp = 0.85;
 
+// Query-side adjacency iterator.
+// This is intentionally read-only: it never installs a block into
+// Vertex::blk_list[...].buf, never marks a ZNS block invalid, and never bumps
+// global_cache_blk. Update paths use cacheBlock()/dirty buffers; query paths
+// should use this helper so read IO cannot turn into writeback pressure.
+template <typename Fn>
+static inline void for_each_neighbor_readonly(Vertex *v, Fn &&fn)
+{
+    std::shared_lock<std::shared_timed_mutex> lock(v->mutex);
+    if (v->degree == 0) {
+        return;
+    }
+
+    if (v->blk_list.empty()) {
+        for (int32_t i = 0; i < v->degree; i++) {
+            if (v->cache_buf[i] >= 0) {
+                fn(v->cache_buf[i]);
+            }
+        }
+        return;
+    }
+
+    int32_t tmp_blk_buf[PM_BLK_SIZE];
+    for (int32_t blkidx = 0; blkidx < static_cast<int32_t>(v->blk_list.size()); blkidx++) {
+        int32_t *blk_ptr = v->blk_list[blkidx].buf;
+        if (blk_ptr == nullptr) {
+            readBlockFromZoneInto(zns.dev_fd, tmp_blk_buf, PM_BLK_SIZE,
+                                  v->blk_list[blkidx].global_wp);
+            blk_ptr = tmp_blk_buf;
+        }
+        for (int32_t j = 0; j < PM_BLK_SIZE; j++) {
+            if (blk_ptr[j] >= 0) {
+                fn(blk_ptr[j]);
+            }
+        }
+    }
+}
+
 // 在当前图存储之上直接执行 PageRank。
 // 这里既支持从 cache_buf 读取，也支持从 zone 中按块读取邻接。
 ScoreT * PageRankPullGS(int max_iters, double epsilon = 1e-4) 
@@ -44,42 +82,16 @@ ScoreT * PageRankPullGS(int max_iters, double epsilon = 1e-4)
         // cout << "thread: " << omp_get_thread_num() << " total threads: " << omp_get_num_threads();
             ScoreT incoming_total = 0;
             Vertex *v = global_vectex_vec[vidx];
-            int32_t blk_cnt = v->blk_list.size();
-            int32_t *tmp_blk_ptr = nullptr;
-
-            if (v->blk_list.empty()) {
-                for (int32_t i = 0; i < v->degree; i++) {
-                    incoming_total += outgoing_contrib[v->cache_buf[i]];
-                }
-            } else {
-                if (v->blk_list.size() == 1 && v->blk_list[0].buf == nullptr) {
-                    cacheBlock(v, 0);  
-                }
-                for (int blkidx = 0; blkidx < v->blk_list.size(); blkidx++) {
-                    if (v->blk_list[blkidx].buf != nullptr) {
-                        tmp_blk_ptr = v->blk_list[blkidx].buf;
-                        for (int j = 0; j < PM_BLK_SIZE; j++) {
-                            if (tmp_blk_ptr[j] >= 0) {
-                                incoming_total += outgoing_contrib[tmp_blk_ptr[j]];
-                            }
-                        }
-                    } else {
-                        readBlockFromZone(zns.dev_fd, tmp_blk_ptr, PM_BLK_SIZE, v->blk_list[blkidx].global_wp);
-                        for (int j = 0; j < PM_BLK_SIZE; j++) {
-                            if (tmp_blk_ptr[j] >= 0) {
-                                incoming_total += outgoing_contrib[tmp_blk_ptr[j]];
-                            }
-                        }
-                        delete[] tmp_blk_ptr;
-                        tmp_blk_ptr = nullptr;
-                    }
-                }
-            }
+            int32_t degree = 0;
+            for_each_neighbor_readonly(v, [&](int32_t neighbor) {
+                incoming_total += outgoing_contrib[neighbor];
+                degree++;
+            });
 
             ScoreT old_score = scores[vidx];
             scores[vidx] = base_score + kDamp * incoming_total;
             error += fabs(scores[vidx] - old_score);
-            outgoing_contrib[vidx] = scores[vidx] / v->degree;
+            outgoing_contrib[vidx] = degree == 0 ? 0 : scores[vidx] / degree;
             // delete[] tmp_blk_ptr;
         }
         // cout << "iter: " << iter << " total_num_access: " << total_num_access << endl;
@@ -102,54 +114,15 @@ int32_t BUStep(pvector<int32_t> &parent, Bitmap &front, Bitmap &next) {
     for (int32_t uidx=0; uidx < global_max_vid; uidx++) {
         if (parent[uidx] < 0) {
             Vertex *v = global_vectex_vec[uidx];
-            int32_t blk_num = v->blk_list.size();
-            int32_t arr_cap = v->pma->arr_cap;
-
-            int32_t *tmp_blk_ptr = nullptr;
-
-            if (v->blk_list.empty()) {
-                for (int32_t i = 0; i < v->degree; i++) {
-                    if (front.get_bit(v->cache_buf[i])) {
-                        parent[uidx] = v->cache_buf[i];
-                        awake_count++;
-                        next.set_bit(uidx);
-                        break;
-                    }
+            bool found = false;
+            for_each_neighbor_readonly(v, [&](int32_t neighbor) {
+                if (!found && front.get_bit(neighbor)) {
+                    parent[uidx] = neighbor;
+                    awake_count++;
+                    next.set_bit(uidx);
+                    found = true;
                 }
-            } else {
-                if (v->blk_list.size() == 1 && v->blk_list[0].buf == nullptr) {
-                    cacheBlock(v, 0);  
-                }
-                for (int blkidx = 0; blkidx < v->blk_list.size(); blkidx++) {
-                    if (v->blk_list[blkidx].buf != nullptr) {
-                        tmp_blk_ptr = v->blk_list[blkidx].buf;
-                        for (int j = 0; j < PM_BLK_SIZE; j++) {
-                            if (tmp_blk_ptr[j] >= 0) {
-                                if (front.get_bit(tmp_blk_ptr[j])) {
-                                    parent[uidx] = tmp_blk_ptr[j];
-                                    awake_count++;
-                                    next.set_bit(uidx);
-                                    break;
-                                }
-                            }
-                        }
-                    } else {
-                        readBlockFromZone(zns.dev_fd, tmp_blk_ptr, PM_BLK_SIZE, v->blk_list[blkidx].global_wp);
-                        for (int j = 0; j < PM_BLK_SIZE; j++) {
-                            if (tmp_blk_ptr[j] >= 0) {
-                                if (front.get_bit(tmp_blk_ptr[j])) {
-                                    parent[uidx] = tmp_blk_ptr[j];
-                                    awake_count++;
-                                    next.set_bit(uidx);
-                                    break;
-                                }
-                            }
-                        }
-                        delete[] tmp_blk_ptr;
-                        tmp_blk_ptr = nullptr;
-                    }
-                }
-            }
+            });
         }
     }
   return awake_count;
@@ -165,60 +138,15 @@ int64_t TDStep(pvector<int32_t> &parent, SlidingQueue<int32_t> &queue) {
         for (auto q_iter = queue.begin(); q_iter < queue.end(); q_iter++) {
             int32_t uidx = *q_iter;
             Vertex *v = global_vectex_vec[uidx];
-            int32_t blk_num = v->blk_list.size();
-            int32_t arr_cap = v->pma->arr_cap;
-            int32_t *tmp_blk_ptr = nullptr;
-
-            if (v->blk_list.empty()) {
-                for (int32_t i = 0; i < v->degree; i++) {
-                    int32_t curr_val = parent[v->cache_buf[i]];
+            for_each_neighbor_readonly(v, [&](int32_t neighbor) {
+                    int32_t curr_val = parent[neighbor];
                     if (curr_val < 0) {
-                        if (compare_and_swap(parent[v->cache_buf[i]], curr_val, uidx)) {
-                            lqueue.push_back(v->cache_buf[i]);
+                        if (compare_and_swap(parent[neighbor], curr_val, uidx)) {
+                            lqueue.push_back(neighbor);
                             scout_count += -curr_val;
                         }
                     }
-                }
-            } else {
-                if (v->blk_list.size() == 1 && v->blk_list[0].buf == nullptr) {
-                    cacheBlock(v, 0);  
-                }
-                for (int blkidx = 0; blkidx < v->blk_list.size(); blkidx++) {
-                    if (v->blk_list[blkidx].buf != nullptr) {
-                        tmp_blk_ptr = v->blk_list[blkidx].buf;
-                        for (int j = 0; j < PM_BLK_SIZE; j++) {
-                            if (tmp_blk_ptr[j] >= 0) {
-                                if (tmp_blk_ptr[j] >= 0) {
-                                    int32_t curr_val = parent[tmp_blk_ptr[j]];
-                                    if (curr_val < 0) {
-                                        if (compare_and_swap(parent[tmp_blk_ptr[j]], curr_val, uidx)) {
-                                            lqueue.push_back(tmp_blk_ptr[j]);
-                                            scout_count += -curr_val;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        readBlockFromZone(zns.dev_fd, tmp_blk_ptr, PM_BLK_SIZE, v->blk_list[blkidx].global_wp);
-                        for (int j = 0; j < PM_BLK_SIZE; j++) {
-                            if (tmp_blk_ptr[j] >= 0) {
-                                if (tmp_blk_ptr[j] >= 0) {
-                                    int32_t curr_val = parent[tmp_blk_ptr[j]];
-                                    if (curr_val < 0) {
-                                        if (compare_and_swap(parent[tmp_blk_ptr[j]], curr_val, uidx)) {
-                                            lqueue.push_back(tmp_blk_ptr[j]);
-                                            scout_count += -curr_val;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        delete[] tmp_blk_ptr;
-                        tmp_blk_ptr = nullptr;
-                    }
-                }
-            }
+            });
         }
         lqueue.flush();
     }
@@ -250,8 +178,10 @@ void BitmapToQueue(const Bitmap &bm, SlidingQueue<int32_t> &queue) {
 pvector<int32_t> InitParent(void) {
     pvector<int32_t> parent(global_max_vid);
     #pragma omp parallel for
-    for (int32_t n=0; n < global_max_vid; n++)
+    for (int32_t n=0; n < global_max_vid; n++) {
+        std::shared_lock<std::shared_timed_mutex> lock(global_vectex_vec[n]->mutex);
         parent[n] = global_vectex_vec[n]->degree != 0 ? -global_vectex_vec[n]->degree : -1;
+    }
     return parent;
 }
 
@@ -271,7 +201,11 @@ pvector<int32_t> DOBFS(int32_t source, int alpha = 15, int beta = 18) {
     Bitmap front(global_max_vid);
     front.reset();
     int64_t edges_to_check = global_edge_num;
-    int64_t scout_count = global_vectex_vec[source]->degree;
+    int64_t scout_count = 0;
+    {
+        std::shared_lock<std::shared_timed_mutex> lock(global_vectex_vec[source]->mutex);
+        scout_count = global_vectex_vec[source]->degree;
+    }
     while (!queue.empty()) {
         if (scout_count > edges_to_check / alpha) {
         int32_t awake_count, old_awake_count;
@@ -486,15 +420,10 @@ pvector<int32_t> ShiloachVishkin(void) {
         #pragma omp parallel for
         for (int32_t uidx=0; uidx < global_max_vid; uidx++) {
             Vertex *v = global_vectex_vec[uidx];
-            int32_t blk_num = v->blk_list.size();
-            int32_t arr_cap = v->pma->arr_cap;
-            int32_t *tmp_blk_ptr = nullptr;
-
-            if (v->blk_list.empty()) {
-                for (int32_t i = 0; i < v->degree; i++) {
+            for_each_neighbor_readonly(v, [&](int32_t neighbor) {
                     int32_t comp_u = comp[uidx];
-                    int32_t comp_v = comp[v->cache_buf[i]];
-                    if (comp_u == comp_v) continue;
+                    int32_t comp_v = comp[neighbor];
+                    if (comp_u == comp_v) return;
                     // Hooking condition so lower component ID wins independent of direction
                     int32_t high_comp = comp_u > comp_v ? comp_u : comp_v;
                     int32_t low_comp = comp_u + (comp_v - high_comp);
@@ -502,49 +431,7 @@ pvector<int32_t> ShiloachVishkin(void) {
                         change = true;
                         comp[high_comp] = low_comp;
                     }
-                }
-            } else {
-                if (v->blk_list.size() == 1 && v->blk_list[0].buf == nullptr) {
-                    cacheBlock(v, 0);  
-                }
-                for (int blkidx = 0; blkidx < v->blk_list.size(); blkidx++) {
-                    if (v->blk_list[blkidx].buf != nullptr) {
-                        tmp_blk_ptr = v->blk_list[blkidx].buf;
-                        for (int j = 0; j < PM_BLK_SIZE; j++) {
-                            if (tmp_blk_ptr[j] >= 0) {
-                                int32_t comp_u = comp[uidx];
-                                int32_t comp_v = comp[tmp_blk_ptr[j]];
-                                if (comp_u == comp_v) continue;
-                                // Hooking condition so lower component ID wins independent of direction
-                                int32_t high_comp = comp_u > comp_v ? comp_u : comp_v;
-                                int32_t low_comp = comp_u + (comp_v - high_comp);
-                                if (high_comp == comp[high_comp]) {
-                                    change = true;
-                                    comp[high_comp] = low_comp;
-                                }
-                            }
-                        }
-                    } else {
-                        readBlockFromZone(zns.dev_fd, tmp_blk_ptr, PM_BLK_SIZE, v->blk_list[blkidx].global_wp);
-                        for (int j = 0; j < PM_BLK_SIZE; j++) {
-                            if (tmp_blk_ptr[j] >= 0) {
-                                int32_t comp_u = comp[uidx];
-                                int32_t comp_v = comp[tmp_blk_ptr[j]];
-                                if (comp_u == comp_v) continue;
-                                // Hooking condition so lower component ID wins independent of direction
-                                int32_t high_comp = comp_u > comp_v ? comp_u : comp_v;
-                                int32_t low_comp = comp_u + (comp_v - high_comp);
-                                if (high_comp == comp[high_comp]) {
-                                    change = true;
-                                    comp[high_comp] = low_comp;
-                                }
-                            }
-                        }
-                        delete[] tmp_blk_ptr;
-                        tmp_blk_ptr = nullptr;
-                    }
-                }
-            }
+            });
         }
         #pragma omp parallel for
         for (int32_t n=0; n < global_max_vid; n++) {
