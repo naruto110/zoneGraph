@@ -1220,6 +1220,7 @@ static void resetZoneMetadataAndQueue(int32_t zone_idx)
 
 static bool garbageCollectVictimZone(int32_t victim_zone)
 {
+    lock_guard<std::mutex> gc_lock(global_gc_mutex);
     if (victim_zone < 0 || victim_zone >= static_cast<int32_t>(global_zone_vec.size())) {
         return false;
     }
@@ -1228,12 +1229,27 @@ static bool garbageCollectVictimZone(int32_t victim_zone)
     int32_t moved = 0;
     int32_t *array = nullptr;
     unsigned long long rp = static_cast<unsigned long long>(victim_zone) * zns.zone_size;
+    beginZNSEpoch();
     for (int32_t blkidx = 0; blkidx < zns.nr_blocks_perzone; blkidx++) {
         blk_info info = global_zone_vec[victim_zone]->blk_info_vec[blkidx];
         if (info.status) {
             Vertex *v = global_vectex_vec[info.src];
+            unique_lock<std::shared_timed_mutex> vertex_lock(v->mutex, defer_lock);
+            if (!vertex_lock.try_lock()) {
+                cout << "GC abort: busy vertex " << info.src << endl;
+                commitZNSEpoch();
+                delete[] array;
+                return false;
+            }
+            blk_info cur_info = global_zone_vec[victim_zone]->blk_info_vec[blkidx];
+            if (!cur_info.status || cur_info.src != info.src ||
+                cur_info.blkIndex != info.blkIndex) {
+                rp += zns_alloc_unit_size();
+                continue;
+            }
             unsigned long long new_wp = 0;
             if (!requestRelocationBlock(v, victim_zone, new_wp)) {
+                commitZNSEpoch();
                 delete[] array;
                 return false;
             }
@@ -1253,6 +1269,7 @@ static bool garbageCollectVictimZone(int32_t victim_zone)
         }
         rp += zns_alloc_unit_size();
     }
+    commitZNSEpoch();
     delete[] array;
 
     resetZoneMetadataAndQueue(victim_zone);

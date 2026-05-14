@@ -232,6 +232,7 @@ uint64_t global_committed_op_id = 0;
 bool global_edge_log_replay_active = false;
 std::mutex global_zns_record_mutex;
 std::mutex global_redo_log_mutex;
+std::mutex global_gc_mutex;
 
 class MemoryWPQueue {
 public:

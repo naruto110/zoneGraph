@@ -193,6 +193,7 @@ void garbage_collection() {
 		3. 更新顶点元数据和 zone 元数据
 		4. reset 原 zone，并把它设为新的空白 zone
 	*/
+	lock_guard<std::mutex> gc_lock(global_gc_mutex);
 	cout << "garbage collection begin!" << endl;
 	unsigned long long wp = 0;
 	unsigned long long rp = 0;
@@ -208,6 +209,7 @@ void garbage_collection() {
 		rp = zns.zone_size * zidx;
 
 		int tmp_used_blk = 0;
+		beginZNSEpoch();
 		// 将该 zone 的有效块复制到空白 zone 中
 		for (int blkidx = 0; blkidx < zns.nr_blocks_perzone; blkidx++) {
 			if (test_block(zidx, blkidx)) { // 当前为有效块
@@ -224,6 +226,18 @@ void garbage_collection() {
 				int32_t vid = global_zone_vec[zidx]->blk_info_vec[blkidx].src;
 				int32_t ori_blk_idx = global_zone_vec[zidx]->blk_info_vec[blkidx].blkIndex;
 				Vertex *v = global_vectex_vec[vid];
+				unique_lock<std::shared_timed_mutex> vertex_lock(v->mutex, defer_lock);
+				if (!vertex_lock.try_lock()) {
+					cout << "GC abort: busy vertex " << vid << endl;
+					commitZNSEpoch();
+					delete[] array;
+					return;
+				}
+				blk_info cur_info = global_zone_vec[zidx]->blk_info_vec[blkidx];
+				if (!cur_info.status || cur_info.src != vid ||
+				    cur_info.blkIndex != ori_blk_idx) {
+					continue;
+				}
 				if (global_zns_record_enabled) {
 					writeZNSRecord(zns.dev_fd, vid, ori_blk_idx, v->pma, array, PM_BLK_SIZE, wp);
 				} else {
@@ -240,6 +254,7 @@ void garbage_collection() {
 			}
 			rp += zns_alloc_unit_size();
 		}
+		commitZNSEpoch();
 		// 把空白 zone 剩余位置重新加入空闲块队列
 		for (int i = tmp_used_blk; i < zns.nr_blocks_perzone; i++) {
 			pm_blk blk{};
@@ -260,6 +275,7 @@ void garbage_collection_new() {
 			并行模式的垃圾回收版本。
 			回收后将空闲块重新放回对应 zone 的分配队列中。
 		*/
+	lock_guard<std::mutex> gc_lock(global_gc_mutex);
 	double start_t = get_current_time();
 	cout << "garbage collection begin! global_empty_zone:" << global_empty_zone << endl;
 	unsigned long long wp = 0;
@@ -284,6 +300,7 @@ void garbage_collection_new() {
 		rp = (unsigned long long)zns.zone_size * (unsigned long long)zidx;
 
 		int tmp_used_blk = 0;
+		beginZNSEpoch();
 		// 将有效块搬迁到空白 zone 中
 		for (int blkidx = 0; blkidx < zns.nr_blocks_perzone; blkidx++) {
 			if (test_block(zidx, blkidx)) { // 当前为有效块
@@ -301,6 +318,18 @@ void garbage_collection_new() {
 				int32_t vid = global_zone_vec[zidx]->blk_info_vec[blkidx].src;
 				int32_t ori_blk_idx = global_zone_vec[zidx]->blk_info_vec[blkidx].blkIndex;
 				Vertex *v = global_vectex_vec[vid];
+				unique_lock<std::shared_timed_mutex> vertex_lock(v->mutex, defer_lock);
+				if (!vertex_lock.try_lock()) {
+					cout << "GC abort: busy vertex " << vid << endl;
+					commitZNSEpoch();
+					delete[] array;
+					return;
+				}
+				blk_info cur_info = global_zone_vec[zidx]->blk_info_vec[blkidx];
+				if (!cur_info.status || cur_info.src != vid ||
+				    cur_info.blkIndex != ori_blk_idx) {
+					continue;
+				}
 				if (global_zns_record_enabled) {
 					writeZNSRecord(zns.dev_fd, vid, ori_blk_idx, v->pma, array, PM_BLK_SIZE, wp);
 				} else {
@@ -317,6 +346,7 @@ void garbage_collection_new() {
 			}
 			rp += zns_alloc_unit_size();
 		}
+		commitZNSEpoch();
 		// 将空白 zone 剩余块重新加入对应分配队列
 		for (int i = tmp_used_blk; i < zns.nr_blocks_perzone; i++) {
 			global_blk_queues[zidx]->memoryWPs.push(wp);

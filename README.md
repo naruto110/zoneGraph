@@ -468,6 +468,28 @@ mark_zone(src, blkIndex, new_wp)
 
 优先只在当前请求 class 的 zone 集合中选 victim。比如 hot zone 满了，先对 hot zone 做 GC。若失败，再 fallback 到全局 class-aware GC。
 
+### 6.4 GC 并发与 record commit
+
+GC 与查询/更新的并发边界：
+
+```text
+1. GC 先持有 global_gc_mutex，保证同一时刻只有一个 GC。
+2. 搬迁某个有效 block 前，GC 尝试获取该 block 所属顶点的 unique_lock。
+3. 如果顶点正被查询、更新或刷盘占用，GC 放弃本轮 victim，不 reset zone。
+4. 只有成功拿到顶点锁后，GC 才会更新 v->blk_list[blk_idx].global_wp 和 zone metadata。
+```
+
+record 模式下，GC 搬迁也有 epoch 边界：
+
+```text
+beginZNSEpoch()
+  写搬迁后的 DATA record
+commitZNSEpoch()
+  COMMIT 成功后才 reset victim zone
+```
+
+如果 GC 中途因为 busy vertex 或分配失败放弃，会先提交已经成功搬迁的 DATA records，再返回失败；victim zone 不会 reset。因此恢复时不会出现“旧 zone 已 reset、新 DATA record 未 COMMIT 而被忽略”的丢块窗口。
+
 ## 7. ZNS-Native 恢复
 
 启用写入 record：
@@ -635,7 +657,9 @@ for_each_neighbor_readonly(Vertex *v, Fn &&fn)
 6. 查询路径不调用 cacheBlock()，因此不会 invalid 旧 ZNS block，不会增加 global_cache_blk，也不会触发 dumpToZone()。
 ```
 
-对应地，边插入/删除仍使用 `Vertex::mutex` 的 `unique_lock`。`dumpToZone()`、`dumpToZoneZoneSerial()` 和 `persist_cache_vertices_as_records()` 在释放 `buf`、更新 `global_wp` 或把 cache-only 顶点持久化为 record 前，也会持有该顶点的 `unique_lock`。因此当前实现保证的是：
+对应地，边插入/删除仍使用 `Vertex::mutex` 的 `unique_lock`。`dumpToZone()`、`dumpToZoneZoneSerial()` 和 `persist_cache_vertices_as_records()` 在释放 `buf`、更新 `global_wp` 或把 cache-only 顶点持久化为 record 前，也会持有该顶点的 `unique_lock`。GC 搬迁有效 block 时会先持有 `global_gc_mutex` 串行化 GC，再对被搬迁 block 所属顶点尝试获取 `unique_lock`；如果顶点正被查询、更新或刷盘占用，本轮 GC 会放弃当前 victim，不 reset zone。这样避免 GC 与查询/更新同时改同一顶点的 `blk_list/global_wp`，也避免自锁。
+
+因此当前实现保证的是：
 
 ```text
 单个顶点读取期间的内存安全和结构一致性：
@@ -643,6 +667,9 @@ for_each_neighbor_readonly(Vertex *v, Fn &&fn)
 
 查询读 ZNS block 不产生写放大：
   查询从 ZNS 读入的 block 是临时只读 buffer，用完即丢，不进入 dirty cache。
+
+GC 与查询/更新的顶点级互斥：
+  GC 只有拿到目标顶点 unique_lock 后才会搬迁该顶点 block 并更新 global_wp。
 ```
 
 当前实现还不是完整的全图 MVCC snapshot。也就是说，长查询可能在不同顶点上看到不同提交时刻的状态，但每个顶点自身的读取是互斥保护的。完整快照一致性需要后续引入：
@@ -858,6 +885,8 @@ record 模式下预留独立 redo log zone，边插入/删除先追加 `EdgeLogR
 8. record header 当前是 version 3，升级前写入的旧版 record 需要旧程序恢复，或后续补兼容读取逻辑。
 9. `pm_blk` 的 block meta 是内存态派生索引，不持久化。新增会改变 block payload 的路径时，需要调用 `refresh_pm_blk_meta()` 或确保恢复/读入时重建。
 10. 当前并发查询实现提供顶点级读写互斥和只读 ZNS block streaming，不提供全图固定 snapshot；需要严格 snapshot 的实验应继续实现 `VertexVersion + BlockVersion + global_graph_epoch`。
+11. GC 若遇到 busy vertex 会放弃当前 victim，不 reset zone；这保证并发安全，但可能导致本次空间回收失败，调用方需要有重试或错误处理。
+12. record 模式下 GC 搬迁已经在 reset 前提交 DATA epoch，但还没有实现 MVCC 旧版本延迟 reset；如果未来引入全图 snapshot 查询，需要把 reset 延迟到没有活跃查询引用旧 epoch 之后。
 
 ## 13. 下次继续开发建议
 
