@@ -1,6 +1,6 @@
 # zoneGraph 项目说明
 
-本文档用于快速恢复项目上下文。当前工程围绕动态图邻接表在 ZNS SSD 上的存储、更新、GC 和恢复进行实验。代码里同时保留了原始 payload-only 路径和新增实验路径，后续修改时应优先保持这些路径可对比。
+本文档用于快速恢复项目上下文。当前工程围绕动态图邻接表在 ZNS SSD 上的存储、更新、GC 和 restart recovery 进行实验。这里的 recovery 主要指服务器重启后从 ZNS records 重建 DRAM 中的运行时 metadata，以及通过 redo log 补齐尚未 checkpoint 到 ZNS DATA record 的 cache-only 小度顶点更新；不把真实突然断电下的设备持久化顺序作为实验验证目标。代码里同时保留了原始 payload-only 路径和新增实验路径，后续修改时应优先保持这些路径可对比。
 
 ## 1. 总体思路
 
@@ -80,7 +80,7 @@ pm_blk.global_wp             -> ZNS physical offset
 (src_vid, pma_blk_idx) -> ZNS zone block / ZNS record
 ```
 
-更新时不原地覆盖旧 block，而是把受影响的 PMA block 作为新版本追加写到 ZNS，并更新 `pm_blk.global_wp`。旧版本通过 `global_zone_vec` 中的 zone/block metadata 失效，后续由 GC 搬迁或回收。record 模式下，`ZNSBlockHeader` 会持久化 `src_vid` 和 `pma_blk_idx`，因此恢复时可以扫描 ZNS records 重建该映射，而不依赖掉电前的内存状态。
+更新时不原地覆盖旧 block，而是把受影响的 PMA block 作为新版本追加写到 ZNS，并更新 `pm_blk.global_wp`。旧版本通过 `global_zone_vec` 中的 zone/block metadata 失效，后续由 GC 搬迁或回收。record 模式下，`ZNSBlockHeader` 会持久化 `src_vid` 和 `pma_blk_idx`，因此重启恢复时可以扫描 ZNS records 重建该映射，而不依赖重启前的 DRAM 状态。
 
 ## 2. 主要文件
 
@@ -399,7 +399,7 @@ DATA seq 范围等于 first_seq / last_seq
 DATA checksum 汇总等于 aggregate_checksum
 ```
 
-如果掉电发生在 COMMIT 写入前，或者 COMMIT / DATA 任一部分不完整导致校验不匹配，该 epoch 会被整体忽略。
+如果 COMMIT record 不存在，或者 COMMIT / DATA 任一部分不完整导致校验不匹配，该 epoch 会被整体忽略。
 
 ## 5. Zone-Class 策略
 
@@ -474,9 +474,10 @@ GC 与查询/更新的并发边界：
 
 ```text
 1. GC 先持有 global_gc_mutex，保证同一时刻只有一个 GC。
-2. 搬迁某个有效 block 前，GC 尝试获取该 block 所属顶点的 unique_lock。
-3. 如果顶点正被查询、更新或刷盘占用，GC 放弃本轮 victim，不 reset zone。
-4. 只有成功拿到顶点锁后，GC 才会更新 v->blk_list[blk_idx].global_wp 和 zone metadata。
+2. class-aware/class-local GC 会锁住 victim zone 的分配队列，防止其他刷盘线程在 GC 期间继续向 victim zone 分配新 block。
+3. 搬迁某个有效 block 前，GC 尝试获取该 block 所属顶点的 unique_lock。
+4. 如果顶点正被查询、更新或刷盘占用，GC 放弃本轮 victim，不 reset zone。
+5. 只有成功拿到顶点锁后，GC 才会更新 v->blk_list[blk_idx].global_wp 和 zone metadata。
 ```
 
 record 模式下，GC 搬迁也有 epoch 边界：
@@ -490,7 +491,27 @@ commitZNSEpoch()
 
 如果 GC 中途因为 busy vertex 或分配失败放弃，会先提交已经成功搬迁的 DATA records，再返回失败；victim zone 不会 reset。因此恢复时不会出现“旧 zone 已 reset、新 DATA record 未 COMMIT 而被忽略”的丢块窗口。
 
-## 7. ZNS-Native 恢复
+## 7. ZNS-Native Restart Recovery
+
+当前恢复模型是 restart recovery / DRAM metadata recovery：
+
+```text
+假设:
+  重启前已经成功写入的 ZNS DATA/COMMIT/redo records 在设备上可读。
+
+恢复目标:
+  1. 重建 DRAM 中丢失的 Vertex / PMA / blk_list / zone metadata。
+  2. 从 block payload 重建 valid_count / valid_bitmap / min_val / max_val。
+  3. 通过 redo log 回放未进入 ZNS checkpoint 的 cache-only 小度顶点更新。
+  4. 统计 metadata/data/redo zone 扫描和图结构重建时间。
+
+不验证:
+  1. pwrite 返回后真实掉电是否已持久化。
+  2. flush/FUA/PLP/控制器缓存语义。
+  3. 任意突然断电时刻的 power-fail atomicity。
+```
+
+因此，本文实验重点是重启后的扫描和 DRAM 状态重建成本，而不是设备级掉电一致性。
 
 启用写入 record：
 
@@ -627,12 +648,12 @@ recovery_time_sec:
   recover_graph_from_zns_records() 的总耗时。
 ```
 
-一致性语义：
+restart recovery 语义：
 
 - 新版本写完整后，即使旧版本仍然在盘上，恢复时也会选择 `seq` 最大的 record。
-- 掉电发生在 DATA record 写入过程中时，checksum/tail magic 不匹配的 record 会被恢复扫描忽略。
-- 掉电发生在一个 epoch 的 COMMIT 写入前时，该 epoch 的 DATA record 整批不会参与恢复。
-- 掉电发生在 COMMIT 完整写入后时，恢复会用 COMMIT 中的数量、seq 范围和汇总 checksum 验证该 epoch 是否完整。
+- DATA record 写入过程中出现 partial/corrupt record 时，checksum/tail magic 不匹配的 record 会被恢复扫描忽略。
+- 一个 epoch 的 COMMIT record 不存在时，该 epoch 的 DATA record 整批不会参与恢复。
+- COMMIT record 存在时，恢复会用 COMMIT 中的数量、seq 范围和汇总 checksum 验证该 epoch 是否完整。
 - redo log 使用独立预留 zone，当前恢复采用保守全量回放策略。
 - 由于小度顶点可能长期只存在 DRAM cache，只有在 checkpoint 明确持久化 cache-only 顶点后，`committed_op_id` 才能作为跳过 redo log 的安全高水位；当前实现采用保守策略，按顺序回放 redo log，利用 INSERT/DELETE 的幂等性保证正确性。
 - 当前实现已有 metadata zone 的 epoch commit，但还没有 checkpoint summary，恢复仍需要扫描 data zone。
@@ -865,13 +886,13 @@ sudo ./main_pma_check_new 0 1 parallel2 --zns-record --cache-threshold 4 --print
 - class-aware 搬迁：减少恢复后布局混乱。
 - class-local 优先：hot zone 满时优先清理 hot zone，而不是立即全盘 GC。
 
-### 11.7 ZNS-native record 恢复
+### 11.7 ZNS-native record restart recovery
 
-每条 DATA record 自描述，恢复不依赖运行时 `global_zone_vec`。record 模式下最后一个 zone 作为 metadata zone，批量写入完成后追加 COMMIT record。恢复只使用通过 COMMIT 校验的 epoch，再通过 `epoch/seq` 选择最新版本，为掉电恢复提供基本事务边界。
+每条 DATA record 自描述，恢复不依赖运行时 `global_zone_vec`。record 模式下最后一个 zone 作为 metadata zone，批量写入完成后追加 COMMIT record。重启恢复只使用通过 COMMIT 校验的 epoch，再通过 `epoch/seq` 选择最新版本，用于重建 DRAM metadata 和最新 block 映射。
 
 ### 11.8 独立 redo log zone + 保守回放
 
-record 模式下预留独立 redo log zone，边插入/删除先追加 `EdgeLogRecord`，再修改 DRAM 图结构。恢复时先恢复已提交的 ZNS 块级快照，再按 `op_id` 顺序回放 redo log。该设计覆盖 cache-only 小度顶点未写入 ZNS 的情况，同时支持 `--no-cache` 与默认 cache 策略的恢复开销/写放大对比。
+record 模式下预留独立 redo log zone，边插入/删除先追加 `EdgeLogRecord`，再修改 DRAM 图结构。重启恢复时先恢复已提交的 ZNS 块级快照，再按 `op_id` 顺序回放 redo log。该设计覆盖 cache-only 小度顶点未写入 ZNS DATA record 的情况，同时支持 `--no-cache` 与默认 cache 策略的恢复开销/写放大对比。
 
 ## 12. 当前限制和注意事项
 
@@ -887,6 +908,7 @@ record 模式下预留独立 redo log zone，边插入/删除先追加 `EdgeLogR
 10. 当前并发查询实现提供顶点级读写互斥和只读 ZNS block streaming，不提供全图固定 snapshot；需要严格 snapshot 的实验应继续实现 `VertexVersion + BlockVersion + global_graph_epoch`。
 11. GC 若遇到 busy vertex 会放弃当前 victim，不 reset zone；这保证并发安全，但可能导致本次空间回收失败，调用方需要有重试或错误处理。
 12. record 模式下 GC 搬迁已经在 reset 前提交 DATA epoch，但还没有实现 MVCC 旧版本延迟 reset；如果未来引入全图 snapshot 查询，需要把 reset 延迟到没有活跃查询引用旧 epoch 之后。
+13. 当前实验目标是 restart recovery 时间和 DRAM metadata/cache-only 数据重建，不验证真实突然断电下 `pwrite`、flush/FUA、PLP 或控制器缓存的持久化顺序。
 
 ## 13. 下次继续开发建议
 
@@ -894,7 +916,7 @@ record 模式下预留独立 redo log zone，边插入/删除先追加 `EdgeLogR
 
 1. 给 `--recover-zns` 增加更详细的统计输出：扫描 record 数、无效 header 数、checksum fail 数、每个 zone live record 数。
 2. 增加 `ZoneSummary`，避免每次恢复扫描全部 data zone。
-3. 增加 crash 模拟开关，例如写 header 后退出、写 payload 后退出，验证 checksum 和 seq 选择逻辑。
+3. 增加 corrupt/partial record 模拟开关，例如写 header 后退出、写 payload 后退出，验证 checksum 和 seq 选择逻辑。
 4. 对 record 模式下 GC 后恢复做专项验证，确认搬迁后的 `seq` 和 `global_wp` 正确。
 5. 把 hot/cold/hub 阈值做成命令行参数，方便实验扫描。
 6. 将 `min_val / max_val` 接入 block-level 查询剪枝，先在 block meta 上定位候选 block，再读取 payload。

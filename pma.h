@@ -1192,7 +1192,7 @@ static int32_t chooseVictimZone(const vector<int32_t> &zone_ids)
     return best_zone;
 }
 
-static void resetZoneMetadataAndQueue(int32_t zone_idx)
+static void resetZoneMetadataAndQueue(int32_t zone_idx, bool lock_queue = true)
 {
     if (zone_idx < 0 || zone_idx >= static_cast<int32_t>(global_blk_queues.size())) {
         return;
@@ -1207,7 +1207,10 @@ static void resetZoneMetadataAndQueue(int32_t zone_idx)
         zone->blk_info_vec[blkidx] = blk_info();
     }
 
-    lock_guard<std::mutex> lock(global_blk_queues[zone_idx]->mtx_);
+    unique_lock<std::mutex> queue_lock(global_blk_queues[zone_idx]->mtx_, defer_lock);
+    if (lock_queue) {
+        queue_lock.lock();
+    }
     while (!global_blk_queues[zone_idx]->memoryWPs.empty()) {
         global_blk_queues[zone_idx]->memoryWPs.pop();
     }
@@ -1224,8 +1227,12 @@ static bool garbageCollectVictimZone(int32_t victim_zone)
     if (victim_zone < 0 || victim_zone >= static_cast<int32_t>(global_zone_vec.size())) {
         return false;
     }
+    if (victim_zone >= static_cast<int32_t>(global_blk_queues.size())) {
+        return false;
+    }
 
     cout << "GC victim zone: " << victim_zone << endl;
+    unique_lock<std::mutex> victim_queue_lock(global_blk_queues[victim_zone]->mtx_);
     int32_t moved = 0;
     int32_t *array = nullptr;
     unsigned long long rp = static_cast<unsigned long long>(victim_zone) * zns.zone_size;
@@ -1272,7 +1279,7 @@ static bool garbageCollectVictimZone(int32_t victim_zone)
     commitZNSEpoch();
     delete[] array;
 
-    resetZoneMetadataAndQueue(victim_zone);
+    resetZoneMetadataAndQueue(victim_zone, false);
     cout << "GC moved blocks: " << moved << endl;
     return true;
 }
@@ -1280,8 +1287,7 @@ static bool garbageCollectVictimZone(int32_t victim_zone)
 bool garbage_collection_by_mode(VertexClass requested_class)
 {
     if (!global_zone_class_enabled || global_blk_queues.empty()) {
-        garbage_collection();
-        return true;
+        return garbage_collection();
     }
 
     int32_t victim = -1;
@@ -1336,7 +1342,15 @@ bool requestClassifiedBlock(Vertex *v, unsigned long long &wp)
         return true;
     }
 
-    if (garbage_collection_by_mode(vclass)) {
+    bool resume_epoch = global_zns_record_enabled && global_zns_epoch_active;
+    if (resume_epoch) {
+        commitZNSEpoch();
+    }
+    bool gc_ok = garbage_collection_by_mode(vclass);
+    if (resume_epoch) {
+        beginZNSEpoch();
+    }
+    if (gc_ok) {
         if (vclass == VERTEX_HUB && requestBlockFromZoneSet(hub_zone_ids, wp)) {
             return true;
         }
@@ -1651,7 +1665,18 @@ void dumpToZone(void)
                     }
                 } else {
                     if (graph_blk_que.size() == 0) {
-                        garbage_collection();
+                        commitZNSEpoch();
+                        lock.unlock();
+                        bool gc_ok = garbage_collection();
+                        lock.lock();
+                        beginZNSEpoch();
+                        if (!gc_ok || graph_blk_que.empty()) {
+                            std::cerr << "No free baseline blocks after GC." << std::endl;
+                            exit(EXIT_FAILURE);
+                        }
+                        if (v->blk_list[blkidx].buf == nullptr) {
+                            continue;
+                        }
                     }
                     new_blk = graph_blk_que.front();
                     graph_blk_que.pop();
@@ -1761,7 +1786,14 @@ static bool request_any_record_block(Vertex *v, unsigned long long &wp)
         wp = blk.global_wp;
         return true;
     }
+    bool resume_epoch = global_zns_record_enabled && global_zns_epoch_active;
+    if (resume_epoch) {
+        commitZNSEpoch();
+    }
     garbage_collection_by_mode(VERTEX_COLD);
+    if (resume_epoch) {
+        beginZNSEpoch();
+    }
     if (!graph_blk_que.empty()) {
         pm_blk blk = graph_blk_que.front();
         graph_blk_que.pop();

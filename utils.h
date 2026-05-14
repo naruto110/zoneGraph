@@ -186,7 +186,7 @@ void report_zones_info(struct zbd_zone	*zones, int nr_zones) {
 
 // 基线模式垃圾回收：
 // 把有效块搬迁到当前空白 zone，再 reset 原 zone。
-void garbage_collection() {
+bool garbage_collection() {
 	/*
 		1. 遍历各个 zone，找到有效块
 		2. 将有效块复制到空白 zone
@@ -231,7 +231,7 @@ void garbage_collection() {
 					cout << "GC abort: busy vertex " << vid << endl;
 					commitZNSEpoch();
 					delete[] array;
-					return;
+					return false;
 				}
 				blk_info cur_info = global_zone_vec[zidx]->blk_info_vec[blkidx];
 				if (!cur_info.status || cur_info.src != vid ||
@@ -268,9 +268,10 @@ void garbage_collection() {
 		global_empty_zone = zidx;
 	}
 	delete[] array;
+	return true;
 }
 
-void garbage_collection_new() {
+bool garbage_collection_new() {
 		/*
 			并行模式的垃圾回收版本。
 			回收后将空闲块重新放回对应 zone 的分配队列中。
@@ -323,7 +324,7 @@ void garbage_collection_new() {
 					cout << "GC abort: busy vertex " << vid << endl;
 					commitZNSEpoch();
 					delete[] array;
-					return;
+					return false;
 				}
 				blk_info cur_info = global_zone_vec[zidx]->blk_info_vec[blkidx];
 				if (!cur_info.status || cur_info.src != vid ||
@@ -364,6 +365,7 @@ void garbage_collection_new() {
 
 	double end_t = get_current_time();
     cout << "Garbage collection time: " << end_t - start_t << endl;
+	return true;
 }
 
 
