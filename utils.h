@@ -25,6 +25,7 @@ bool readZNSRedoLogChecked(int fd, EdgeLogRecord &record, unsigned long long wp)
 void readZNSRecordPayload(int fd, int32_t* &array, size_t size, unsigned long long wp);
 void writeGraphBlockToZone(Vertex *v, int32_t blk_idx, unsigned long long wp);
 void mark_zone(int32_t vid, int32_t blk_idx, unsigned long long wp);
+void reset_zns_write_pointers(void);
 
 // ZNS 设备的运行时信息。
 // 这里既保存 libzbd 返回的设备元信息，也保存本工程用于块划分的参数。
@@ -79,6 +80,8 @@ static void zns_close(void)
 int zns_open(void) {
 	unsigned int i;
 	int ret;
+	unsigned long long min_zone_capacity = 0;
+	int total_blks = 0;
 
 	/* 打开设备文件 */
 	zns.dev_fd = zbd_open(zns.path, O_RDWR, &zns.info);
@@ -91,48 +94,6 @@ int zns_open(void) {
 	// 	return 1;
 	// }
 
-	zns.nr_zones = zns.info.nr_zones;
-	zns.zone_size = zns.info.zone_size;
-	zns.nr_blocks_perzone = zns.zone_size / zns_alloc_unit_size();
-	if (zns.nr_zones == 0 || zns.nr_blocks_perzone == 0) {
-		fprintf(stderr, "Invalid ZNS geometry: nr_zones=%u zone_size=%d block_size=%zu\n",
-				zns.nr_zones, zns.zone_size, zns_alloc_unit_size());
-		zns_close();
-		return -1;
-	}
-	nr_blocks_perzone = zns.nr_blocks_perzone;
-	if (global_zns_record_enabled) {
-		if (zns.info.nr_zones < 4) {
-			fprintf(stderr, "ZNS record mode requires at least 4 zones for data, GC, redo log, and metadata\n");
-			zns_close();
-			return -1;
-		}
-		global_meta_zone = zns.info.nr_zones - 1; // 最后一个 zone 专门追加 commit record
-		global_redo_zone = zns.info.nr_zones - 2; // 倒数第二个 zone 专门追加 redo log
-		global_empty_zone = zns.info.nr_zones - 3;  // 倒数第三个 zone 作为 GC 空白缓冲区
-		global_num_queues = zns.nr_zones - 3; // 其余 zone 用于 data record 分配
-		global_meta_wp = static_cast<unsigned long long>(global_meta_zone) *
-		                 static_cast<unsigned long long>(zns.zone_size);
-		global_redo_wp = static_cast<unsigned long long>(global_redo_zone) *
-		                 static_cast<unsigned long long>(zns.zone_size);
-	} else {
-		global_meta_zone = -1;
-		global_meta_wp = 0;
-		global_redo_zone = -1;
-		global_redo_wp = 0;
-		global_empty_zone = zns.info.nr_zones - 1;  // 默认把最后一个 zone 作为空白缓冲区
-		global_num_queues = zns.nr_zones - 1; // 其余 zone 用于分配可写块
-	}
-
-	int total_blks = zns.info.zone_size / zns_alloc_unit_size();
-
-	global_zone_vec.clear();
-	for (int i = 0; i < zns.nr_zones; i++) {
-		ZoneStatus *z = new ZoneStatus(total_blks, 0);
-		// cout << "test---0 blk_info_vec[5].status: " << z->blk_info_vec[5].status << endl;
-		global_zone_vec.push_back(z);
-	}
-
 	/* 获取设备上的全部 zone 信息 */
 	ret = zbd_list_zones(zns.dev_fd, 0, 0, ZBD_RO_ALL,
 			     &zns.zones, &zns.nr_zones);
@@ -143,6 +104,64 @@ int zns_open(void) {
 		ret = 1;
 		goto out;
 	}
+
+	zns.zone_size = zns.info.zone_size;
+	{
+		size_t payload_unit = global_zns_record_enabled ?
+			static_cast<size_t>(ZNS_RECORD_SIZE) :
+			static_cast<size_t>(ZONE_BLK_SIZE);
+		size_t lblock = zns.info.lblock_size == 0 ? 1 :
+			static_cast<size_t>(zns.info.lblock_size);
+		global_zns_alloc_unit_size =
+			((payload_unit + lblock - 1) / lblock) * lblock;
+	}
+
+	min_zone_capacity = static_cast<unsigned long long>(zns.zone_size);
+	for (int32_t zidx = 0; zidx < static_cast<int32_t>(zns.nr_zones); zidx++) {
+		if (zns.zones[zidx].capacity > 0) {
+			min_zone_capacity = min(min_zone_capacity,
+			                        static_cast<unsigned long long>(zns.zones[zidx].capacity));
+		}
+	}
+	zns.nr_blocks_perzone = min_zone_capacity / zns_alloc_unit_size();
+	if (zns.nr_zones == 0 || zns.nr_blocks_perzone == 0) {
+		fprintf(stderr, "Invalid ZNS geometry: nr_zones=%u zone_size=%d block_size=%zu\n",
+				zns.nr_zones, zns.zone_size, zns_alloc_unit_size());
+		zns_close();
+		return -1;
+	}
+	nr_blocks_perzone = zns.nr_blocks_perzone;
+	if (global_zns_record_enabled) {
+		if (zns.nr_zones < 4) {
+			fprintf(stderr, "ZNS record mode requires at least 4 zones for data, GC, redo log, and metadata\n");
+			zns_close();
+			return -1;
+		}
+		global_meta_zone = zns.nr_zones - 1; // 最后一个 zone 专门追加 commit record
+		global_redo_zone = zns.nr_zones - 2; // 倒数第二个 zone 专门追加 redo log
+		global_empty_zone = zns.nr_zones - 3;  // 倒数第三个 zone 作为 GC 空白缓冲区
+		global_num_queues = zns.nr_zones - 3; // 其余 zone 用于 data record 分配
+		global_meta_wp = static_cast<unsigned long long>(global_meta_zone) *
+		                 static_cast<unsigned long long>(zns.zone_size);
+		global_redo_wp = static_cast<unsigned long long>(global_redo_zone) *
+		                 static_cast<unsigned long long>(zns.zone_size);
+	} else {
+		global_meta_zone = -1;
+		global_meta_wp = 0;
+		global_redo_zone = -1;
+		global_redo_wp = 0;
+		global_empty_zone = zns.nr_zones - 1;  // 默认把最后一个 zone 作为空白缓冲区
+		global_num_queues = zns.nr_zones - 1; // 其余 zone 用于分配可写块
+	}
+
+	total_blks = zns.nr_blocks_perzone;
+
+	global_zone_vec.clear();
+	for (int i = 0; i < static_cast<int>(zns.nr_zones); i++) {
+		ZoneStatus *z = new ZoneStatus(total_blks, 0);
+		global_zone_vec.push_back(z);
+	}
+	reset_zns_write_pointers();
 
 	// zns_fix_zone_values(zns.zones, zns.nr_zones);  
 
@@ -156,6 +175,97 @@ out:
 		zns_close();
 
 	return ret;
+}
+
+static unsigned long long zns_zone_start(int32_t zone_idx)
+{
+	return static_cast<unsigned long long>(zone_idx) *
+	       static_cast<unsigned long long>(zns.zone_size);
+}
+
+static unsigned long long zns_zone_limit(int32_t zone_idx)
+{
+	unsigned long long start = zns_zone_start(zone_idx);
+	if (zone_idx >= 0 && zone_idx < static_cast<int32_t>(zns.nr_zones) &&
+	    zns.zones != nullptr && zns.zones[zone_idx].capacity > 0) {
+		return start + static_cast<unsigned long long>(zns.zones[zone_idx].capacity);
+	}
+	return start + static_cast<unsigned long long>(zns.zone_size);
+}
+
+void reset_zns_write_pointers(void)
+{
+	global_zone_write_wp.assign(zns.nr_zones, 0);
+	global_zone_write_limit.assign(zns.nr_zones, 0);
+	for (int32_t zone_idx = 0; zone_idx < static_cast<int32_t>(zns.nr_zones); zone_idx++) {
+		global_zone_write_wp[zone_idx] = zns_zone_start(zone_idx);
+		global_zone_write_limit[zone_idx] = zns_zone_limit(zone_idx);
+	}
+}
+
+static int32_t zns_zone_idx_from_wp(unsigned long long wp)
+{
+	if (zns.zone_size <= 0) {
+		return -1;
+	}
+	return static_cast<int32_t>(wp / static_cast<unsigned long long>(zns.zone_size));
+}
+
+static void reset_zns_write_pointer_for_zone(int32_t zone_idx)
+{
+	if (zone_idx < 0 || zone_idx >= static_cast<int32_t>(global_zone_write_wp.size())) {
+		return;
+	}
+	global_zone_write_wp[zone_idx] = zns_zone_start(zone_idx);
+	global_zone_write_limit[zone_idx] = zns_zone_limit(zone_idx);
+}
+
+static void checkedZoneWrite(int fd, const void *data, size_t bytes,
+                             unsigned long long wp, const char *tag)
+{
+	if (fd == -1) {
+		perror("ZNS device is not open");
+		exit(EXIT_FAILURE);
+	}
+	if (bytes > zns_alloc_unit_size()) {
+		std::cerr << tag << " write size " << bytes
+		          << " exceeds allocation unit " << zns_alloc_unit_size() << std::endl;
+		exit(EXIT_FAILURE);
+	}
+	if ((wp % zns_alloc_unit_size()) != 0) {
+		std::cerr << tag << " unaligned wp=" << wp
+		          << " unit=" << zns_alloc_unit_size() << std::endl;
+		exit(EXIT_FAILURE);
+	}
+
+	int32_t zone_idx = zns_zone_idx_from_wp(wp);
+	if (zone_idx < 0 || zone_idx >= static_cast<int32_t>(global_zone_write_wp.size())) {
+		std::cerr << tag << " invalid zone for wp=" << wp << std::endl;
+		exit(EXIT_FAILURE);
+	}
+
+	vector<char> write_buf(zns_alloc_unit_size(), 0);
+	memcpy(write_buf.data(), data, bytes);
+
+	lock_guard<std::mutex> lock(global_zns_device_write_mutex);
+	if (wp != global_zone_write_wp[zone_idx]) {
+		std::cerr << tag << " out-of-order ZNS write: zone=" << zone_idx
+		          << " expected_wp=" << global_zone_write_wp[zone_idx]
+		          << " actual_wp=" << wp << std::endl;
+		exit(EXIT_FAILURE);
+	}
+	if (wp + zns_alloc_unit_size() > global_zone_write_limit[zone_idx]) {
+		std::cerr << tag << " write exceeds zone capacity: zone=" << zone_idx
+		          << " wp=" << wp
+		          << " limit=" << global_zone_write_limit[zone_idx] << std::endl;
+		exit(EXIT_FAILURE);
+	}
+	if (pwrite(fd, write_buf.data(), zns_alloc_unit_size(), wp) !=
+	    static_cast<ssize_t>(zns_alloc_unit_size())) {
+		perror(tag);
+		exit(EXIT_FAILURE);
+	}
+	global_zone_write_wp[zone_idx] += zns_alloc_unit_size();
 }
 
 void report_device_info(struct zbd_info info) {
@@ -263,8 +373,9 @@ bool garbage_collection() {
 			graph_blk_que.push(blk);
 			wp += zns_alloc_unit_size(); 
 		}
-		// reset 原 zone
+	// reset 原 zone
 		zbd_reset_zones(zns.dev_fd, (zidx * zns.zone_size), zns.zone_size);
+		reset_zns_write_pointer_for_zone(zidx);
 		global_empty_zone = zidx;
 	}
 	delete[] array;
@@ -276,6 +387,9 @@ bool garbage_collection_new() {
 			并行模式的垃圾回收版本。
 			回收后将空闲块重新放回对应 zone 的分配队列中。
 		*/
+	std::cerr << "garbage_collection_new is disabled: it swaps the empty zone "
+	          << "with data zones and breaks per-zone write queues." << std::endl;
+	return false;
 	lock_guard<std::mutex> gc_lock(global_gc_mutex);
 	double start_t = get_current_time();
 	cout << "garbage collection begin! global_empty_zone:" << global_empty_zone << endl;
@@ -359,6 +473,7 @@ bool garbage_collection_new() {
 		}
 		// reset 原 zone
 		zbd_reset_zones(zns.dev_fd, (zidx * zns.zone_size), zns.zone_size);
+		reset_zns_write_pointer_for_zone(zidx);
 		global_empty_zone = zidx;
 	}
 	delete[] array;
@@ -377,8 +492,16 @@ int generate_block_baseline(int blk_num) {
 	*/
 	// cout << "generate zone blocks" << endl;
 	while (blk_num--) {
-		if (global_blk_wp >= static_cast<unsigned long long>(global_num_queues) *
-			static_cast<unsigned long long>(zns.zone_size)) {
+		int32_t zone_idx = zns_zone_idx_from_wp(global_blk_wp);
+		while (zone_idx >= 0 && zone_idx < global_num_queues &&
+		       global_blk_wp + zns_alloc_unit_size() >
+		       zns_zone_start(zone_idx) +
+		       static_cast<unsigned long long>(zns.nr_blocks_perzone) *
+		       zns_alloc_unit_size()) {
+			global_blk_wp = zns_zone_start(zone_idx + 1);
+			zone_idx = zns_zone_idx_from_wp(global_blk_wp);
+		}
+		if (zone_idx < 0 || zone_idx >= global_num_queues) {
 			std::cerr << "No free baseline blocks before reserved empty zone." << std::endl;
 			exit(EXIT_FAILURE);
 		}
@@ -484,10 +607,7 @@ void writeBlockToZone(int fd, int32_t* array, size_t size, unsigned long long wp
 
     // 按块粒度写入设备
     size_t bytesToWrite = size * sizeof(int32_t);
-    if (pwrite(fd, array, bytesToWrite, wp) != bytesToWrite) {
-        perror("Failed to write data");
-        exit(EXIT_FAILURE);
-    }
+    checkedZoneWrite(fd, array, bytesToWrite, wp, "Failed to write data block");
 }
 
 void readBlockFromZone(int fd, int32_t* &array, size_t size, unsigned long long wp) {
@@ -621,9 +741,8 @@ uint64_t appendZNSRedoLog(uint32_t op_type, int32_t src, int32_t dst)
     unsigned long long wp = 0;
     {
         lock_guard<std::mutex> lock(global_redo_log_mutex);
-        if (global_redo_wp >=
-            (static_cast<unsigned long long>(global_redo_zone + 1) *
-             static_cast<unsigned long long>(zns.zone_size))) {
+        if (global_redo_wp + zns_alloc_unit_size() >
+            global_zone_write_limit[global_redo_zone]) {
             std::cerr << "No free space left in ZNS redo log zone." << std::endl;
             exit(EXIT_FAILURE);
         }
@@ -641,14 +760,12 @@ uint64_t appendZNSRedoLog(uint32_t op_type, int32_t src, int32_t dst)
         wp = global_redo_wp;
         global_redo_wp += zns_alloc_unit_size();
         global_last_applied_op_id = record.op_id;
-    }
 
-    char raw[ZNS_RECORD_SIZE];
-    memset(raw, 0, sizeof(raw));
-    memcpy(raw, &record, sizeof(record));
-    if (pwrite(zns.dev_fd, raw, ZNS_RECORD_SIZE, wp) != ZNS_RECORD_SIZE) {
-        perror("Failed to write ZNS redo log record");
-        exit(EXIT_FAILURE);
+        char raw[ZNS_RECORD_SIZE];
+        memset(raw, 0, sizeof(raw));
+        memcpy(raw, &record, sizeof(record));
+        checkedZoneWrite(zns.dev_fd, raw, ZNS_RECORD_SIZE, wp,
+                         "Failed to write ZNS redo log record");
     }
     return record.op_id;
 }
@@ -703,14 +820,11 @@ void writeZNSRecord(int fd, int32_t src_vid, int32_t pma_blk_idx, PMA *pma,
             combine_epoch_checksum(global_zns_epoch_aggregate_checksum,
                                    header.seq,
                                    header.checksum);
-    }
 
-    memcpy(record, &header, sizeof(header));
-    memcpy(record + sizeof(ZNSBlockHeader), array, size * sizeof(int32_t));
-
-    if (pwrite(fd, record, ZNS_RECORD_SIZE, wp) != ZNS_RECORD_SIZE) {
-        perror("Failed to write ZNS record");
-        exit(EXIT_FAILURE);
+        memcpy(record, &header, sizeof(header));
+        memcpy(record + sizeof(ZNSBlockHeader), array, size * sizeof(int32_t));
+        checkedZoneWrite(fd, record, ZNS_RECORD_SIZE, wp,
+                         "Failed to write ZNS record");
     }
 }
 
@@ -745,9 +859,9 @@ void commitZNSEpoch(void)
             global_zns_epoch_active = false;
             return;
         }
-        if (global_meta_zone < 0 || global_meta_wp >=
-            (static_cast<unsigned long long>(global_meta_zone + 1) *
-             static_cast<unsigned long long>(zns.zone_size))) {
+        if (global_meta_zone < 0 ||
+            global_meta_wp + zns_alloc_unit_size() >
+            global_zone_write_limit[global_meta_zone]) {
             std::cerr << "No free space left in ZNS metadata zone for commit record." << std::endl;
             exit(EXIT_FAILURE);
         }
@@ -776,14 +890,12 @@ void commitZNSEpoch(void)
         global_zns_epoch_last_seq = 0;
         global_zns_epoch_data_count = 0;
         global_zns_epoch_aggregate_checksum = 0;
-    }
 
-    char record[ZNS_RECORD_SIZE];
-    memset(record, 0, sizeof(record));
-    memcpy(record, &header, sizeof(header));
-    if (pwrite(zns.dev_fd, record, ZNS_RECORD_SIZE, commit_wp) != ZNS_RECORD_SIZE) {
-        perror("Failed to write ZNS commit record");
-        exit(EXIT_FAILURE);
+        char record[ZNS_RECORD_SIZE];
+        memset(record, 0, sizeof(record));
+        memcpy(record, &header, sizeof(header));
+        checkedZoneWrite(zns.dev_fd, record, ZNS_RECORD_SIZE, commit_wp,
+                         "Failed to write ZNS commit record");
     }
 }
 

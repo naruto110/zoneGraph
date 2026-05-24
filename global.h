@@ -9,7 +9,6 @@
 #include <unistd.h>
 #include <filesystem>
 #include <vector>
-#include "bitmap.h"
 #include <queue>
 #include "utils.h"
 #include "tools.h"
@@ -31,7 +30,7 @@
 using namespace std;
 
 #define PM_BLK_SIZE 64
-#define CACHE_BLK_SIZE 4 // 小度顶点直接缓存在 DRAM 中的邻居数量
+#define CACHE_BLK_SIZE 16 // 小度顶点直接缓存在 DRAM 中的邻居数量
 #define ZONE_BLK_SIZE (PM_BLK_SIZE * sizeof(int32_t))  // 一个逻辑块的字节数
 #define NVME_DEVICE_PATH "/dev/nvme0n1"
 #define ZNS_BLOCK_MAGIC 0x5A47504D
@@ -114,7 +113,7 @@ typedef struct pma_blk
 	int32_t min_val = INT32_MAX; // 当前块内有效邻居最小值，仅内存态
 	int32_t max_val = INT32_MIN; // 当前块内有效邻居最大值，仅内存态
 	int32_t valid_count = 0; // 当前块内非 -1 slot 数
-	uint64_t valid_bitmap = 0; // bit i 表示 buf[i] 或持久化 payload[i] 有效
+	bool sorted = true; // 当前块内有效元素按 slot 顺序非降序，可用二分/有序扫描
 } pm_blk;
 
 static inline void reset_pm_blk_meta(pm_blk &blk)
@@ -122,7 +121,7 @@ static inline void reset_pm_blk_meta(pm_blk &blk)
 	blk.min_val = INT32_MAX;
 	blk.max_val = INT32_MIN;
 	blk.valid_count = 0;
-	blk.valid_bitmap = 0;
+	blk.sorted = true;
 }
 
 static inline void refresh_pm_blk_meta(pm_blk &blk, const int32_t *data)
@@ -131,12 +130,16 @@ static inline void refresh_pm_blk_meta(pm_blk &blk, const int32_t *data)
 	if (data == nullptr) {
 		return;
 	}
+	int32_t prev = INT32_MIN;
 	for (int32_t i = 0; i < PM_BLK_SIZE; i++) {
 		if (data[i] >= 0) {
-			blk.valid_bitmap |= (1ULL << i);
 			blk.valid_count++;
 			blk.min_val = min(blk.min_val, data[i]);
 			blk.max_val = max(blk.max_val, data[i]);
+			if (data[i] < prev) {
+				blk.sorted = false;
+			}
+			prev = data[i];
 		}
 	}
 }
@@ -168,6 +171,8 @@ public:
 	vector<pm_blk> blk_list; // PMA 对应的块列表
 		PMA* pma; // 顶点的 PMA 元数据
 		int32_t cache_buf[CACHE_BLK_SIZE]; // 小度顶点的快速缓存
+		unordered_map<int32_t, vector<int32_t>> pending_insert_by_block; // 按 PMA block 分组的 append-only DRAM 插入缓冲
+		vector<int32_t> pending_insert_unplaced; // 暂时无法绑定到稳定 block 的插入缓冲
 		mutable std::shared_timed_mutex mutex; // 顶点级锁，用于并发插入/恢复
 
 		bool recovery_flag; // 恢复过程中避免重复处理
@@ -214,7 +219,7 @@ public:
 };
 
 int nr_blocks_perzone = 0;
-bool global_zns_record_enabled = false;
+bool global_zns_record_enabled = true;
 uint64_t global_zns_record_seq = 1;
 uint64_t global_current_epoch = 1;
 bool global_zns_epoch_active = false;
@@ -230,9 +235,13 @@ uint64_t global_next_op_id = 1;
 uint64_t global_last_applied_op_id = 0;
 uint64_t global_committed_op_id = 0;
 bool global_edge_log_replay_active = false;
+size_t global_zns_alloc_unit_size = ZNS_RECORD_SIZE;
 std::mutex global_zns_record_mutex;
 std::mutex global_redo_log_mutex;
+std::mutex global_zns_device_write_mutex;
 std::mutex global_gc_mutex;
+std::mutex global_pending_merge_mutex;
+std::shared_timed_mutex global_query_update_mutex;
 
 class MemoryWPQueue {
 public:
@@ -288,7 +297,6 @@ public:
 
 typedef struct zone_information
 {
-	// Bitmap32 myBitmap;  // 旧版本中用于标记块状态的位图
 	int nr_blocks; // zone 内总块数
 	int val_blocks; // zone 内有效块数
 	vector<blk_info> blk_info_vec; // 每个物理块对应的逻辑映射信息
@@ -308,13 +316,18 @@ unsigned long long global_blk_wp = 0; // 基线模式下当前分配到的全局
 int32_t global_blk_id = 0;
 // int32_t global_cache_blk = 0;
 atomic<int> global_cache_blk(0);
-int32_t cache_blk_threshold = 1;
+int32_t cache_blk_threshold = 10;
+atomic<int64_t> global_pending_edge_count(0);
+int64_t pending_merge_threshold = 2;
+bool global_debug_pending_merge = false;
 int32_t global_cache_buf_threshold = CACHE_BLK_SIZE;
 int64_t global_edge_num = 0;
 int32_t global_max_vid = 0;
 vector<Vertex *> global_vectex_vec;
 vector<new_edge> global_edge_vec;
 vector<ZoneStatus *> global_zone_vec;
+vector<unsigned long long> global_zone_write_wp;
+vector<unsigned long long> global_zone_write_limit;
 int32_t global_empty_zone = 0;
 
 int32_t global_num_queues = 0;
@@ -332,8 +345,7 @@ vector<int32_t> hub_zone_ids;
 
 static inline size_t zns_alloc_unit_size(void)
 {
-	return global_zns_record_enabled ? static_cast<size_t>(ZNS_RECORD_SIZE)
-	                                 : static_cast<size_t>(ZONE_BLK_SIZE);
+	return global_zns_alloc_unit_size;
 }
 
 void initial() {

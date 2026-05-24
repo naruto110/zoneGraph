@@ -19,17 +19,18 @@ void set_path(vector<string>& data_path)
 {
     data_path.clear();
 	data_path.push_back("./data.txt");  // 0: 示例数据
-	data_path.push_back("/home/yingsui/data/livejournal/out.e");  // 1: LiveJournal
-    data_path.push_back("/home/yingsui/data/orkut/out.e");  // 2: Orkut
-    data_path.push_back("/home/yingsui/data/skitter/out.e");  // 3: Skitter
-    data_path.push_back("/home/yingsui/data/youtube/out.e");  // 4: YouTube
-    data_path.push_back("/home/yingsui/data/dblp/out.e");  // 5: DBLP
-    data_path.push_back("/home/yingsui/data/roadCA/out.e");  // 6: RoadCA
+	data_path.push_back("./validation_edges.txt");  // 1: 更新/删除验证数据
+	data_path.push_back("/home/yingsui/data/livejournal/out.e");  // 2: LiveJournal
+    data_path.push_back("/home/yingsui/data/orkut/out.e");  // 3: Orkut
+    data_path.push_back("/home/yingsui/data/skitter/out.e");  // 4: Skitter
+    data_path.push_back("/home/yingsui/data/youtube/out.e");  // 5: YouTube
+    data_path.push_back("/home/yingsui/data/dblp/out.e");  // 6: DBLP
+    data_path.push_back("/home/yingsui/data/roadCA/out.e");  // 7: RoadCA
 
-    data_path.push_back("/home/yingsui/data/synthetic/syn19.e");  // 7: synthetic-19
-    data_path.push_back("/home/yingsui/data/synthetic/syn20.e");  // 8: synthetic-20
-    data_path.push_back("/home/yingsui/data/synthetic/syn21.e");  // 9: synthetic-21
-	    data_path.push_back("/home/yingsui/data/synthetic/syn22.e");  // 10: synthetic-22
+    data_path.push_back("/home/yingsui/data/synthetic/syn19.e");  // 8: synthetic-19
+    data_path.push_back("/home/yingsui/data/synthetic/syn20.e");  // 9: synthetic-20
+    data_path.push_back("/home/yingsui/data/synthetic/syn21.e");  // 10: synthetic-21
+	    data_path.push_back("/home/yingsui/data/synthetic/syn22.e");  // 11: synthetic-22
 }
 
 static bool parse_int_arg(const char *arg, int &value)
@@ -56,12 +57,15 @@ static void print_usage(const char *program)
     cerr << "  --no-cache: disable cache_buf and route updates directly to PMA blocks" << endl;
     cerr << "  --cache-threshold <n>: cache up to n neighbors per vertex before PMA migration (0-"
          << CACHE_BLK_SIZE << ", default " << CACHE_BLK_SIZE << ")" << endl;
+    cerr << "  --pending-merge-threshold <n>: merge pending PMA edges after n queued edges (default "
+         << pending_merge_threshold << ")" << endl;
+    cerr << "  --debug-pending-merge: print block values after pending merge/rebalance" << endl;
     cerr << "  --zone-writer: use zone-serial writer when flushing queued/parallel updates" << endl;
     cerr << "  --zone-class: place hot/cold/hub vertices into separate zone pools" << endl;
     cerr << "  --gc-global: use original global GC strategy (default)" << endl;
     cerr << "  --gc-class-aware: choose victim globally, relocate by vertex class" << endl;
     cerr << "  --gc-class-local: GC requested class first, then fallback globally" << endl;
-    cerr << "  --zns-record: write self-describing ZNS records for recovery experiments" << endl;
+    cerr << "  --zns-record: write self-describing ZNS records (default; kept for compatibility)" << endl;
     cerr << "  --recover-zns: recover graph by scanning ZNS records; does not reset zones" << endl;
 }
 
@@ -101,6 +105,8 @@ int main(int argc, char* argv[]) {
         string arg = argv[argi];
         if (arg == "--print-pma") {
             print_pma = true;
+        } else if (arg == "--debug-pending-merge") {
+            global_debug_pending_merge = true;
         } else if (arg == "--compact-delete") {
             global_delete_compaction_enabled = true;
         } else if (arg == "--no-cache") {
@@ -119,6 +125,20 @@ int main(int argc, char* argv[]) {
                 return EXIT_FAILURE;
             }
             global_cache_buf_threshold = threshold;
+            argi += 1;
+        } else if (arg == "--pending-merge-threshold") {
+            if (argi + 1 >= argc) {
+                cerr << "--pending-merge-threshold requires <n>" << endl;
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            int threshold = 0;
+            if (!parse_int_arg(argv[argi + 1], threshold) || threshold <= 0) {
+                cerr << "Invalid pending merge threshold: " << argv[argi + 1] << endl;
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            pending_merge_threshold = threshold;
             argi += 1;
         } else if (arg == "--zone-writer") {
             use_zone_writer = true;
@@ -205,6 +225,9 @@ int main(int argc, char* argv[]) {
         perror("zbd_reset_zones");
         return EXIT_FAILURE;
     }
+    if (!recover_zns) {
+        reset_zns_write_pointers();
+    }
 
     if (recover_zns) {
         recover_graph_from_zns_records();
@@ -242,18 +265,17 @@ int main(int argc, char* argv[]) {
         return EXIT_FAILURE;
     }
     for (const auto &edge : insert_edges) {
-        bool forward_inserted = graph_insert_directed_edge(edge.first, edge.second);
-        bool backward_inserted = graph_insert_directed_edge(edge.second, edge.first);
+        bool inserted = graph_insert_undirected_edge(edge.first, edge.second);
         cout << "Insert edge (" << edge.first << ", " << edge.second << "): "
-             << ((forward_inserted || backward_inserted) ? "inserted" : "already exists") << endl;
+             << (inserted ? "inserted" : "already exists") << endl;
     }
     for (const auto &edge : delete_edges) {
         bool deleted = graph_delete_undirected_edge(edge.first, edge.second);
         cout << "Delete edge (" << edge.first << ", " << edge.second << "): "
              << (deleted ? "deleted" : "not found") << endl;
     }
-    if ((!insert_edges.empty() || !delete_edges.empty()) &&
-        global_cache_blk >= cache_blk_threshold) {
+    merge_all_pending_insert_buffers();
+    if (global_cache_blk > 0) {
         if (use_zone_writer) {
             dumpToZoneZoneSerial();
         } else if (mode == "parallel2") {

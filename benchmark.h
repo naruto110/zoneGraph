@@ -54,12 +54,25 @@ static inline void for_each_neighbor_readonly(Vertex *v, Fn &&fn)
             }
         }
     }
+    for (const auto &entry : v->pending_insert_by_block) {
+        for (int32_t neighbor : entry.second) {
+            if (neighbor >= 0) {
+                fn(neighbor);
+            }
+        }
+    }
+    for (int32_t neighbor : v->pending_insert_unplaced) {
+        if (neighbor >= 0) {
+            fn(neighbor);
+        }
+    }
 }
 
 // 在当前图存储之上直接执行 PageRank。
 // 这里既支持从 cache_buf 读取，也支持从 zone 中按块读取邻接。
 ScoreT * PageRankPullGS(int max_iters, double epsilon = 1e-4) 
 {
+    unique_lock<std::shared_timed_mutex> graph_lock(global_query_update_mutex);
     omp_set_num_threads(THREAD_NUM);
     const ScoreT init_score = 1.0f / global_max_vid;
     const ScoreT base_score = (1.0f - kDamp) / global_max_vid;
@@ -187,6 +200,7 @@ pvector<int32_t> InitParent(void) {
 
 pvector<int32_t> DOBFS(int32_t source, int alpha = 15, int beta = 18) {
 //  PrintStep("Source", static_cast<int32_t>(source));
+    unique_lock<std::shared_timed_mutex> graph_lock(global_query_update_mutex);
     Timer t;
     t.Start();
     pvector<int32_t> parent = InitParent();
@@ -406,6 +420,7 @@ pvector<int32_t> DOBFS(int32_t source, int alpha = 15, int beta = 18) {
 
 // cc
 pvector<int32_t> ShiloachVishkin(void) {
+    unique_lock<std::shared_timed_mutex> graph_lock(global_query_update_mutex);
     pvector<int32_t> comp(global_max_vid);
     #pragma omp parallel for
     for (int32_t n=0; n < global_max_vid; n++)
