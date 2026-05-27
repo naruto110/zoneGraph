@@ -36,15 +36,15 @@ static void rebuild_pma_from_sorted_values(Vertex *v, vector<int32_t> &values);
 static bool pma_contains_scan(Vertex *v, int32_t des);
 static int32_t pma_find_index_scan(Vertex *v, int32_t des);
 static bool find_target_block_for_insert(Vertex *v, int32_t des, int32_t &target_blk);
-static bool find_rebalance_block_for_insert(Vertex *v, int32_t des, int32_t &target_blk);
 static bool pending_insert_contains(Vertex *v, int32_t des);
 static bool pending_insert_remove(Vertex *v, int32_t des);
 static bool pending_insert_empty(Vertex *v);
 static void pending_insert_clear(Vertex *v);
 static int64_t pending_insert_count(Vertex *v);
 static bool merge_pending_values_into_block(Vertex *v, int32_t blk_idx, vector<int32_t> &values);
-static bool rebalance_window_with_pending(Vertex *v, int32_t blk_idx,
-                                          unordered_map<int32_t, vector<int32_t>> &pending_by_block);
+static bool find_rebalance_window(Vertex *v, int32_t blk_idx,
+                                  unordered_map<int32_t, vector<int32_t>> &pending_by_block,
+                                  int32_t &out_window_start, int32_t &out_window_end);
 static void resize_with_pending_values(Vertex *v, vector<int32_t> &values);
 static void resize_with_pending_blocks(Vertex *v,
                                        unordered_map<int32_t, vector<int32_t>> &pending_by_block);
@@ -52,7 +52,7 @@ static void merge_pending_insert_buffer(Vertex *v);
 static void merge_all_pending_insert_buffers(void);
 static void maybe_merge_pending_insert_buffers(void);
 static int32_t find_prev_valid_index(Vertex *src, int32_t from, int32_t index,
-                                     vector<int32_t> &release_blk_vec);
+                                     unordered_map<int32_t, int32_t *> &local_blk_cache);
 static void compute_capacity (PMA* pma);
 int32_t binary_pma_find(PMA* pma, Vertex *src, int32_t des, int32_t from, int32_t to);
 int32_t pma_insert(PMA* pma, Vertex *src, int32_t des, int32_t index);
@@ -63,6 +63,7 @@ static inline int32_t pma_value_at(Vertex *src, int32_t index);
 static int32_t count_window_occupancy(Vertex *src, int32_t from, int32_t to);
 
 int load_graph(string path);
+int scan_graph_metadata(string path);
 void graph_init(int32_t max_vid);
 void graph_maintenance_baseline(void);
 bool cache_insert_unique(Vertex *v, int32_t des);
@@ -77,8 +78,15 @@ static bool graph_delete_directed_edge_locked(int32_t src, int32_t des);
 bool graph_delete_undirected_edge(int32_t src, int32_t des);
 VertexClass classify_vertex(Vertex *v);
 const char *vertex_class_name(VertexClass vclass);
+static void note_vertex_update(Vertex *v);
+static ATZVertexType classify_atz_vertex(Vertex *v);
+static const char *atz_vertex_type_name(ATZVertexType type);
+static const char *atz_zone_type_name(ATZZoneType type);
+static void update_vertex_temperatures(void);
+static void print_atz_gc_summary(void);
 bool requestClassifiedBlock(Vertex *v, unsigned long long &wp);
-bool garbage_collection_by_mode(VertexClass requested_class);
+bool garbage_collection_greedy(void);
+static void maybe_run_proactive_gc(void);
 void print_vertex(int32_t vid, int64_t &total_edges);
 void print_graph(void);
 void print_vertex_pma_blocks(int32_t vid);
@@ -92,11 +100,14 @@ void dumpToZoneParallel(void);
 void dumpToZoneZoneSerial(void);
 void persist_cache_vertices_as_records(void);
 void recover_graph_from_zns_records(void);
+void run_recovery_experiment_from_zns(void);
+void print_dram_metadata_usage(void);
 
 void graph_init_new(int32_t max_vid);
 void graph_maintenance_new(void);
 void graph_maintenance_parallel(void);
 void graph_maintenance_parallel2(void);
+void graph_maintenance_parallel2_streaming(const string &path);
 
 void graph_recovery(void);
 int32_t binary_pma_find_recovery(PMA* pma, Vertex *src, int32_t des, int32_t from, int32_t to);
@@ -265,57 +276,18 @@ static bool find_target_block_for_insert(Vertex *v, int32_t des, int32_t &target
             }
         }
 
-        pm_blk &blk = v->blk_list[blk_idx];
-        bool range_ok = des >= prev_max && des <= next_min;
-        bool has_free = blk.valid_count < local_end;
-        if (range_ok && has_free) {
-            target_blk = blk_idx;
-            return true;
-        }
-
-        if (blk.valid_count > 0) {
-            prev_max = blk.max_val;
-        }
-    }
-    return false;
-}
-
-static bool find_rebalance_block_for_insert(Vertex *v, int32_t des, int32_t &target_blk)
-{
-    if (v->pma == nullptr || v->blk_list.empty()) {
-        return false;
-    }
-
-    int32_t prev_max = INT32_MIN;
-    for (int32_t blk_idx = 0; blk_idx < static_cast<int32_t>(v->blk_list.size()); blk_idx++) {
-        int32_t local_end = pma_block_end(v->pma, blk_idx) - pma_block_start(blk_idx);
-        if (local_end <= 0) {
-            continue;
-        }
-
-        int32_t next_min = INT32_MAX;
-        for (int32_t next_blk = blk_idx + 1;
-             next_blk < static_cast<int32_t>(v->blk_list.size());
-             next_blk++) {
-            if (v->blk_list[next_blk].valid_count > 0) {
-                next_min = v->blk_list[next_blk].min_val;
-                break;
-            }
-        }
-
         if (des >= prev_max && des <= next_min) {
             target_blk = blk_idx;
             return true;
         }
 
-        if (v->blk_list[blk_idx].valid_count > 0) {
+        if (v->blk_list[blk_idx].max_val != INT32_MIN) {
             prev_max = v->blk_list[blk_idx].max_val;
         }
     }
-
-    target_blk = static_cast<int32_t>(v->blk_list.size()) - 1;
-    return target_blk >= 0;
+    return false;
 }
+
 
 static bool pending_insert_contains(Vertex *v, int32_t des)
 {
@@ -379,34 +351,6 @@ static int64_t pending_insert_count(Vertex *v)
     return count;
 }
 
-static bool values_fit_between_neighbors(Vertex *v, int32_t start_blk,
-                                         int32_t end_blk,
-                                         const vector<int32_t> &values)
-{
-    if (values.empty()) {
-        return true;
-    }
-
-    int32_t prev_max = INT32_MIN;
-    for (int32_t blk_idx = start_blk - 1; blk_idx >= 0; blk_idx--) {
-        if (v->blk_list[blk_idx].valid_count > 0) {
-            prev_max = v->blk_list[blk_idx].max_val;
-            break;
-        }
-    }
-
-    int32_t next_min = INT32_MAX;
-    for (int32_t blk_idx = end_blk + 1;
-         blk_idx < static_cast<int32_t>(v->blk_list.size());
-         blk_idx++) {
-        if (v->blk_list[blk_idx].valid_count > 0) {
-            next_min = v->blk_list[blk_idx].min_val;
-            break;
-        }
-    }
-
-    return values.front() >= prev_max && values.back() <= next_min;
-}
 
 static void print_pending_merge_block_values(const char *tag, Vertex *v, int32_t blk_idx)
 {
@@ -443,12 +387,6 @@ static bool merge_pending_values_into_block(Vertex *v, int32_t blk_idx, vector<i
         return true;
     }
     if (blk_idx < 0 || blk_idx >= static_cast<int32_t>(v->blk_list.size())) {
-        return false;
-    }
-
-    sort(values.begin(), values.end());
-    values.erase(unique(values.begin(), values.end()), values.end());
-    if (!values_fit_between_neighbors(v, blk_idx, blk_idx, values)) {
         return false;
     }
 
@@ -536,8 +474,9 @@ static void spread_sorted_values_to_window(Vertex *v, int32_t from, int32_t to,
     refresh_block_meta_range(v, start_blk, end_blk);
 }
 
-static bool rebalance_window_with_pending(Vertex *v, int32_t blk_idx,
-                                          unordered_map<int32_t, vector<int32_t>> &pending_by_block)
+static bool find_rebalance_window(Vertex *v, int32_t blk_idx,
+                                  unordered_map<int32_t, vector<int32_t>> &pending_by_block,
+                                  int32_t &out_window_start, int32_t &out_window_end)
 {
     if (blk_idx < 0 || blk_idx >= static_cast<int32_t>(v->blk_list.size())) {
         return false;
@@ -546,82 +485,34 @@ static bool rebalance_window_with_pending(Vertex *v, int32_t blk_idx,
     PMA *pma = v->pma;
     int32_t index = pma_block_start(blk_idx);
     int32_t height = pma_block_base_height(pma);
-    int32_t window_start = 0;
-    int32_t window_end = 0;
-    int32_t occupancy = 0;
     double density = 0.0;
     double t_height = 0.0;
     double p_height = 0.0;
-    int32_t inserted_count = 0;
 
     do {
         int32_t window_size = pma->seg_len * (1 << height);
         int32_t window = index / window_size;
-        window_start = window * window_size;
-        window_end = min(window_start + window_size, pma->arr_cap);
-        int32_t start_blk = window_start / PM_BLK_SIZE;
-        int32_t end_blk = (window_end - 1) / PM_BLK_SIZE;
-        inserted_count = 0;
-        for (int32_t pending_blk = start_blk; pending_blk <= end_blk; pending_blk++) {
-            auto pending_it = pending_by_block.find(pending_blk);
-            if (pending_it != pending_by_block.end()) {
-                sort(pending_it->second.begin(), pending_it->second.end());
-                pending_it->second.erase(unique(pending_it->second.begin(),
-                                                pending_it->second.end()),
-                                         pending_it->second.end());
-                inserted_count += static_cast<int32_t>(pending_it->second.size());
-            }
+        out_window_start = window * window_size;
+        out_window_end = min(out_window_start + window_size, pma->arr_cap);
+        int32_t start_blk = out_window_start / PM_BLK_SIZE;
+        int32_t end_blk = (out_window_end - 1) / PM_BLK_SIZE;
+
+        int32_t inserted_count = 0;
+        for (int32_t pb = start_blk; pb <= end_blk; pb++) {
+            auto it = pending_by_block.find(pb);
+            if (it != pending_by_block.end())
+                inserted_count += static_cast<int32_t>(it->second.size());
         }
-        occupancy = count_window_occupancy(v, window_start, window_end) + inserted_count;
+        int32_t occupancy = count_window_occupancy(v, out_window_start, out_window_end)
+                            + inserted_count;
         density = static_cast<double>(occupancy) /
-                  static_cast<double>(window_end - window_start);
+                  static_cast<double>(out_window_end - out_window_start);
         t_height = t_0 - (height * pma->delta_t);
         p_height = p_0 + (height * pma->delta_p);
         height++;
-    } while ((density < p_height || density >= t_height) &&
-             height < pma->tree_h);
+    } while ((density < p_height || density >= t_height) && height < pma->tree_h);
 
-    if (density < p_height || density >= t_height) {
-        return false;
-    }
-
-    vector<int32_t> window_values;
-    window_values.reserve(occupancy);
-    int32_t start_blk = window_start / PM_BLK_SIZE;
-    int32_t end_blk = (window_end - 1) / PM_BLK_SIZE;
-    for (int32_t cur_blk = start_blk; cur_blk <= end_blk; cur_blk++) {
-        vector<int32_t> block_values;
-        int32_t block_from = max(window_start, pma_block_start(cur_blk));
-        int32_t block_to = min(window_end, pma_block_end(pma, cur_blk));
-        collect_block_values(v, cur_blk, block_from, block_to, block_values);
-        auto pending_it = pending_by_block.find(cur_blk);
-        if (pending_it != pending_by_block.end()) {
-            block_values.insert(block_values.end(),
-                                pending_it->second.begin(),
-                                pending_it->second.end());
-        }
-        sort(block_values.begin(), block_values.end());
-        block_values.erase(unique(block_values.begin(), block_values.end()),
-                           block_values.end());
-        window_values.insert(window_values.end(),
-                             block_values.begin(),
-                             block_values.end());
-    }
-
-    if (!values_fit_between_neighbors(v, start_blk, end_blk, window_values)) {
-        return false;
-    }
-
-    spread_sorted_values_to_window(v, window_start, window_end, window_values);
-    pma->ele_num += inserted_count;
-    if (global_debug_pending_merge) {
-        cout << "PENDING_REBALANCE_FULL_PMA vid=" << v->id << endl;
-        print_vertex_pma_blocks(v->id);
-    }
-    for (int32_t cur_blk = start_blk; cur_blk <= end_blk; cur_blk++) {
-        pending_by_block.erase(cur_blk);
-    }
-    return true;
+    return !(density < p_height || density >= t_height);
 }
 
 static void resize_with_pending_values(Vertex *v, vector<int32_t> &values)
@@ -737,60 +628,146 @@ static void rebuild_pma_from_sorted_values(Vertex *v, vector<int32_t> &values)
 
 static void merge_pending_insert_buffer(Vertex *v)
 {
-    if (pending_insert_empty(v)) {
-        return;
-    }
+    if (pending_insert_empty(v)) return;
 
     int64_t consumed_pending = pending_insert_count(v);
     unordered_map<int32_t, vector<int32_t>> pending_by_block = v->pending_insert_by_block;
     vector<int32_t> unplaced = v->pending_insert_unplaced;
     pending_insert_clear(v);
 
-    vector<pair<int32_t, vector<int32_t>>> ordered_pending(pending_by_block.begin(),
-                                                           pending_by_block.end());
-    sort(ordered_pending.begin(), ordered_pending.end(),
-         [](const auto &a, const auto &b) {
-             return a.first < b.first;
-         });
+    // Route unplaced values into pending_by_block; collect truly unroutable separately
+    vector<int32_t> unroutable;
+    for (int32_t des : unplaced) {
+        int32_t target_blk = -1;
+        if (find_target_block_for_insert(v, des, target_blk)) {
+            pending_by_block[target_blk].push_back(des);
+            pm_blk &blk = v->blk_list[target_blk];
+            blk.min_val = min(blk.min_val, des);
+            blk.max_val = max(blk.max_val, des);
+        } else {
+            unroutable.push_back(des);
+        }
+    }
+    if (!unroutable.empty()) {
+        // Merge all pending into unroutable and rebuild
+        for (auto &[blk_id, vals] : pending_by_block)
+            unroutable.insert(unroutable.end(), vals.begin(), vals.end());
+        resize_with_pending_values(v, unroutable);
+        global_pending_edge_count -= consumed_pending;
+        return;
+    }
 
-    for (auto &entry : ordered_pending) {
-        int32_t blk_idx = entry.first;
-        auto pending_it = pending_by_block.find(blk_idx);
-        if (pending_it == pending_by_block.end() || pending_it->second.empty()) {
-            continue;
-        }
-        vector<int32_t> values = pending_it->second;
-        if (merge_pending_values_into_block(v, blk_idx, values)) {
+    if (pending_by_block.empty()) {
+        global_pending_edge_count -= consumed_pending;
+        return;
+    }
+
+    // Phase 1: direct merge — insert pending values into free slots
+    vector<int32_t> sorted_blk_ids;
+    sorted_blk_ids.reserve(pending_by_block.size());
+    for (auto &entry : pending_by_block) sorted_blk_ids.push_back(entry.first);
+    sort(sorted_blk_ids.begin(), sorted_blk_ids.end());
+
+    vector<int32_t> needs_rebalance;
+    for (int32_t blk_idx : sorted_blk_ids) {
+        auto it = pending_by_block.find(blk_idx);
+        if (it == pending_by_block.end() || it->second.empty()) continue;
+        if (merge_pending_values_into_block(v, blk_idx, it->second)) {
             pending_by_block.erase(blk_idx);
-            continue;
+        } else {
+            needs_rebalance.push_back(blk_idx);
         }
-        if (rebalance_window_with_pending(v, blk_idx, pending_by_block)) {
-            continue;
+    }
+
+    if (needs_rebalance.empty()) {
+        global_pending_edge_count -= consumed_pending;
+        return;
+    }
+
+    // Phase 2: find rebalance window for each block that needs it
+    // All pending counts (including other failing blocks) are included in occupancy
+    vector<pair<int32_t, int32_t>> slot_windows;
+    slot_windows.reserve(needs_rebalance.size());
+    for (int32_t blk_idx : needs_rebalance) {
+        int32_t ws = 0, we = 0;
+        if (!find_rebalance_window(v, blk_idx, pending_by_block, ws, we)) {
+            resize_with_pending_blocks(v, pending_by_block);
+            global_pending_edge_count -= consumed_pending;
+            return;
         }
+        slot_windows.push_back({ws, we});
+    }
+
+    // Phase 3: merge overlapping windows into unified intervals
+    sort(slot_windows.begin(), slot_windows.end());
+    vector<pair<int32_t, int32_t>> merged_windows;
+    for (auto &w : slot_windows) {
+        if (merged_windows.empty() || w.first >= merged_windows.back().second) {
+            merged_windows.push_back(w);
+        } else {
+            merged_windows.back().second = max(merged_windows.back().second, w.second);
+        }
+    }
+
+    // Phase 4: spread each merged window
+    for (auto &[window_start, window_end] : merged_windows) {
+        int32_t start_blk = window_start / PM_BLK_SIZE;
+        int32_t end_blk = (window_end - 1) / PM_BLK_SIZE;
+
+        int32_t inserted_count = 0;
+        for (int32_t pb = start_blk; pb <= end_blk; pb++) {
+            auto it = pending_by_block.find(pb);
+            if (it != pending_by_block.end())
+                inserted_count += static_cast<int32_t>(it->second.size());
+        }
+
+        // Re-check density for the merged window (may be wider than each individual window)
+        int32_t occupancy = count_window_occupancy(v, window_start, window_end) + inserted_count;
+        double density = static_cast<double>(occupancy) /
+                         static_cast<double>(window_end - window_start);
+        if (density >= t_h) {
+            resize_with_pending_blocks(v, pending_by_block);
+            global_pending_edge_count -= consumed_pending;
+            return;
+        }
+
+        vector<int32_t> window_values;
+        window_values.reserve(occupancy);
+        for (int32_t cur_blk = start_blk; cur_blk <= end_blk; cur_blk++) {
+            vector<int32_t> block_values;
+            int32_t block_from = max(window_start, pma_block_start(cur_blk));
+            int32_t block_to = min(window_end, pma_block_end(v->pma, cur_blk));
+            collect_block_values(v, cur_blk, block_from, block_to, block_values);
+            auto pit = pending_by_block.find(cur_blk);
+            if (pit != pending_by_block.end()) {
+                block_values.insert(block_values.end(),
+                                    pit->second.begin(), pit->second.end());
+            }
+            sort(block_values.begin(), block_values.end());
+            block_values.erase(unique(block_values.begin(), block_values.end()),
+                               block_values.end());
+            window_values.insert(window_values.end(),
+                                 block_values.begin(), block_values.end());
+        }
+
+        spread_sorted_values_to_window(v, window_start, window_end, window_values);
+        v->pma->ele_num += inserted_count;
+
+        if (global_debug_pending_merge) {
+            cout << "PENDING_REBALANCE vid=" << v->id
+                 << " window=[" << window_start << "," << window_end << ")" << endl;
+            print_vertex_pma_blocks(v->id);
+        }
+
+        for (int32_t cur_blk = start_blk; cur_blk <= end_blk; cur_blk++) {
+            pending_by_block.erase(cur_blk);
+        }
+    }
+
+    if (!pending_by_block.empty()) {
         resize_with_pending_blocks(v, pending_by_block);
     }
 
-    for (int32_t des : unplaced) {
-        int32_t target_blk = -1;
-        vector<int32_t> values{des};
-        if (find_target_block_for_insert(v, des, target_blk) &&
-            merge_pending_values_into_block(v, target_blk, values)) {
-            continue;
-        }
-        if (target_blk < 0) {
-            find_rebalance_block_for_insert(v, des, target_blk);
-        }
-        if (target_blk >= 0) {
-            pending_by_block[target_blk].push_back(des);
-        }
-        if (target_blk >= 0 && rebalance_window_with_pending(v, target_blk, pending_by_block)) {
-            continue;
-        }
-        if (target_blk >= 0) {
-            pending_by_block[target_blk].clear();
-        }
-        resize_with_pending_values(v, values);
-    }
     global_pending_edge_count -= consumed_pending;
 }
 
@@ -896,7 +873,7 @@ static void maybe_merge_pending_insert_buffers(void)
 }
 
 static int32_t find_prev_valid_index(Vertex *src, int32_t from, int32_t index,
-                                     vector<int32_t> &release_blk_vec)
+                                     unordered_map<int32_t, int32_t *> &local_blk_cache)
 {
     while (index >= from) {
         int32_t blk_idx = index / PM_BLK_SIZE;
@@ -911,10 +888,17 @@ static int32_t find_prev_valid_index(Vertex *src, int32_t from, int32_t index,
             continue;
         }
 
-        if (blk.buf == nullptr) {
-            readBlockFromZone(zns.dev_fd, blk.buf, PM_BLK_SIZE, blk.global_wp);
-            refresh_pm_blk_meta(blk, blk.buf);
-            release_blk_vec.push_back(blk_idx);
+        const int32_t *data = blk.buf;
+        if (data == nullptr) {
+            auto it = local_blk_cache.find(blk_idx);
+            if (it == local_blk_cache.end()) {
+                int32_t *tmp = nullptr;
+                readBlockFromZone(zns.dev_fd, tmp, PM_BLK_SIZE, blk.global_wp);
+                local_blk_cache[blk_idx] = tmp;
+                data = tmp;
+            } else {
+                data = it->second;
+            }
         }
 
         int32_t scan_from = 0;
@@ -922,7 +906,7 @@ static int32_t find_prev_valid_index(Vertex *src, int32_t from, int32_t index,
             scan_from = from % PM_BLK_SIZE;
         }
         for (int32_t bit = bit_idx; bit >= scan_from; bit--) {
-            if (blk.buf[bit] >= 0) {
+            if (data[bit] >= 0) {
                 return blk_idx * PM_BLK_SIZE + bit;
             }
         }
@@ -978,58 +962,84 @@ static inline int32_t pma_value_at_readonly(Vertex *src, int32_t index) {
 
 static int32_t count_window_occupancy(Vertex *src, int32_t from, int32_t to) {
     int32_t occupancy = 0;
-    for (int32_t idx = from; idx < to; idx++) {
-        int32_t blk_idx = idx / PM_BLK_SIZE;
-        int32_t bit_idx = idx % PM_BLK_SIZE;
-        if (src->blk_list[blk_idx].buf != nullptr) {
-            occupancy += src->blk_list[blk_idx].buf[bit_idx] >= 0 ? 1 : 0;
+    int32_t start_blk = from / PM_BLK_SIZE;
+    int32_t end_blk   = (to - 1) / PM_BLK_SIZE;
+
+    for (int32_t b = start_blk; b <= end_blk; b++) {
+        int32_t local_from = (b == start_blk) ? (from % PM_BLK_SIZE) : 0;
+        int32_t local_to   = (b == end_blk)   ? ((to - 1) % PM_BLK_SIZE) : (PM_BLK_SIZE - 1);
+
+        if (src->blk_list[b].buf != nullptr) {
+            for (int32_t bit = local_from; bit <= local_to; bit++) {
+                if (src->blk_list[b].buf[bit] >= 0) {
+                    occupancy++;
+                }
+            }
         } else {
-            int32_t *tmp_blk_ptr = nullptr;
-            readBlockFromZone(zns.dev_fd, tmp_blk_ptr, PM_BLK_SIZE, src->blk_list[blk_idx].global_wp);
-            occupancy += tmp_blk_ptr[bit_idx] >= 0 ? 1 : 0;
-            delete[] tmp_blk_ptr;
+            int32_t *tmp = nullptr;
+            readBlockFromZone(zns.dev_fd, tmp, PM_BLK_SIZE, src->blk_list[b].global_wp);
+            for (int32_t bit = local_from; bit <= local_to; bit++) {
+                if (tmp[bit] >= 0) {
+                    occupancy++;
+                }
+            }
+            delete[] tmp;
         }
     }
     return occupancy;
 }
 
 
+static inline int32_t get_blk_val(Vertex *src, int32_t global_idx,
+                                   unordered_map<int32_t, int32_t *> &local_blk_cache)
+{
+    int32_t blk_idx = global_idx / PM_BLK_SIZE;
+    int32_t bit_idx = global_idx % PM_BLK_SIZE;
+    if (src->blk_list[blk_idx].buf != nullptr) {
+        return src->blk_list[blk_idx].buf[bit_idx];
+    }
+    auto it = local_blk_cache.find(blk_idx);
+    if (it != local_blk_cache.end()) {
+        return it->second[bit_idx];
+    }
+    return -2; // should not happen after find_prev_valid_index loaded the block
+}
+
+static void release_local_blk_cache(unordered_map<int32_t, int32_t *> &cache)
+{
+    for (auto &kv : cache) {
+        delete[] kv.second;
+    }
+    cache.clear();
+}
+
 // 在 PMA 中查找 des 的前驱位置。
 // 若访问到未缓存的块，会按需从设备换入。
-int32_t binary_pma_find(PMA* pma, Vertex *src, int32_t des, int32_t from, int32_t to) 
+int32_t binary_pma_find(PMA* pma, Vertex *src, int32_t des, int32_t from, int32_t to)
 {
     if (to < 0) {
         return -1;
     }
 
     int32_t index;
-    int32_t blk_idx, bit_idx;
-    // int32_t cur_blk;
-    // int32_t *tmp_blk_ptr = new int32_t[PM_BLK_SIZE];  // 临时块缓冲
-    vector<int32_t> release_blk_vec;
+    unordered_map<int32_t, int32_t *> local_blk_cache;
 
     while (from <= to) {
         int32_t mid = from + (to - from) / 2;
-        int32_t i = find_prev_valid_index(src, from, mid, release_blk_vec);
+        int32_t i = find_prev_valid_index(src, from, mid, local_blk_cache);
 
         if (i < from) {  /* Everything between from and mid (inclusive) is empty. */
             from = mid + 1;
         } else {
-            blk_idx = i / PM_BLK_SIZE;
-            bit_idx = i % PM_BLK_SIZE;
-            // if (src->blk_list[blk_idx].blk_ptr[bit_idx] == des) {
-            if (src->blk_list[blk_idx].buf[bit_idx] == des) {
+            int32_t val = get_blk_val(src, i, local_blk_cache);
+            if (val == des) {
                 index = i;
-                for (int jj = 0; jj < release_blk_vec.size(); jj++) {
-                    delete[] src->blk_list[release_blk_vec[jj]].buf;
-                    src->blk_list[release_blk_vec[jj]].buf = nullptr; // 查找结束后释放临时换入的块
-                }
-                // cout << "error: insert the same neighbor. src: " << src << " des: " << des << endl;
+                release_local_blk_cache(local_blk_cache);
                 return index;
             }
-            else if (src->blk_list[blk_idx].buf[bit_idx] < des) {
+            else if (val < des) {
                 from = mid + 1;
-            } else {  /* pma->array [i].key > key */
+            } else {  /* val > des */
                 to = i - 1;  // 保证最终得到的是小于 des 的最大位置
             }
         }
@@ -1037,57 +1047,42 @@ int32_t binary_pma_find(PMA* pma, Vertex *src, int32_t des, int32_t from, int32_
     /* Didn't find `key'. `to' should hold its predecessor (unless it's empty). */
     index = to;
     if (index < 0) {
-        for (int jj = 0; jj < release_blk_vec.size(); jj++) {
-            delete[] src->blk_list[release_blk_vec[jj]].buf;
-            src->blk_list[release_blk_vec[jj]].buf = nullptr;
-        }
+        release_local_blk_cache(local_blk_cache);
         return -1;
     }
 
-    index = find_prev_valid_index(src, 0, index, release_blk_vec);
+    index = find_prev_valid_index(src, 0, index, local_blk_cache);
 
-    for (int jj = 0; jj < release_blk_vec.size(); jj++) {
-        delete[] src->blk_list[release_blk_vec[jj]].buf;
-        src->blk_list[release_blk_vec[jj]].buf = nullptr; // 查找结束后释放临时换入的块
-    }
+    release_local_blk_cache(local_blk_cache);
     return index;
 }
 
 // 恢复阶段使用的查找版本；若 des 已存在则返回 -1。
-int32_t binary_pma_find_recovery(PMA* pma, Vertex *src, int32_t des, int32_t from, int32_t to) 
+int32_t binary_pma_find_recovery(PMA* pma, Vertex *src, int32_t des, int32_t from, int32_t to)
 {
     if (to < 0) {
         return -1;
     }
 
     int32_t index;
-    int32_t blk_idx, bit_idx;
-    // int32_t cur_blk;
-    // int32_t *tmp_blk_ptr = new int32_t[PM_BLK_SIZE];  // 临时块缓冲
-    vector<int32_t> release_blk_vec;
+    unordered_map<int32_t, int32_t *> local_blk_cache;
 
     while (from <= to) {
         int32_t mid = from + (to - from) / 2;
-        int32_t i = find_prev_valid_index(src, from, mid, release_blk_vec);
+        int32_t i = find_prev_valid_index(src, from, mid, local_blk_cache);
 
         if (i < from) {  /* Everything between from and mid (inclusive) is empty. */
             from = mid + 1;
         } else {
-            blk_idx = i / PM_BLK_SIZE;
-            bit_idx = i % PM_BLK_SIZE;
-            // if (src->blk_list[blk_idx].blk_ptr[bit_idx] == des) {
-            if (src->blk_list[blk_idx].buf[bit_idx] == des) {
+            int32_t val = get_blk_val(src, i, local_blk_cache);
+            if (val == des) {
                 index = i;
-                for (int jj = 0; jj < release_blk_vec.size(); jj++) {
-                    delete[] src->blk_list[release_blk_vec[jj]].buf;
-                    src->blk_list[release_blk_vec[jj]].buf = nullptr; // 查找结束后释放临时换入的块
-                }
-                // cout << "error: insert the same neighbor. src: " << src << " des: " << des << endl;
-                return -1;
+                release_local_blk_cache(local_blk_cache);
+                return -1; // des already exists
             }
-            else if (src->blk_list[blk_idx].buf[bit_idx] < des) {
+            else if (val < des) {
                 from = mid + 1;
-            } else {  /* pma->array [i].key > key */
+            } else {  /* val > des */
                 to = i - 1;  // 保证最终得到的是小于 des 的最大位置
             }
         }
@@ -1095,19 +1090,13 @@ int32_t binary_pma_find_recovery(PMA* pma, Vertex *src, int32_t des, int32_t fro
     /* Didn't find `key'. `to' should hold its predecessor (unless it's empty). */
     index = to;
     if (index < 0) {
-        for (int jj = 0; jj < release_blk_vec.size(); jj++) {
-            delete[] src->blk_list[release_blk_vec[jj]].buf;
-            src->blk_list[release_blk_vec[jj]].buf = nullptr;
-        }
+        release_local_blk_cache(local_blk_cache);
         return -1;
     }
 
-    index = find_prev_valid_index(src, 0, index, release_blk_vec);
+    index = find_prev_valid_index(src, 0, index, local_blk_cache);
 
-    for (int jj = 0; jj < release_blk_vec.size(); jj++) {
-        delete[] src->blk_list[release_blk_vec[jj]].buf;
-        src->blk_list[release_blk_vec[jj]].buf = nullptr; // 查找结束后释放临时换入的块
-    }
+    release_local_blk_cache(local_blk_cache);
     return index;
 }
 
@@ -1338,18 +1327,17 @@ void rebalance(PMA* pma, Vertex *src, int32_t index)
     } while ((density < p_height ||  // 若窗口密度越界，则继续向上扩大窗口
             density >= t_height) &&
            height < pma->tree_h);
-      /* Found a window within threshold. */
-    if (height == pma_block_base_height(pma) + 1)
-        return;
-    
     if (density >= p_height && density < t_height) {
-        // cout << "spread process ---" << endl;
-        spread (pma, src, window_start, window_end, occupancy);
+        // 找到了密度合法的窗口
+        if (window_end - window_start <= PM_BLK_SIZE) {
+            // 窗口就是 block 本身，元素已插入，无需在块内重排
+            return;
+        }
+        spread(pma, src, window_start, window_end, occupancy);
     } else {
-        // print_graph();
-        // cout << "resize process ---" << endl;
-        resize (pma, src);
-  }
+        // 所有层级密度均越界（或 tree_h 过小无法扩窗），扩容重建
+        resize(pma, src);
+    }
 }
 
 
@@ -1379,9 +1367,6 @@ void spread (PMA* pma, Vertex *src, int32_t from, int32_t to, int32_t occupancy)
             tmp_win_arr[i] = -1;
         }
     }
-
-    int32_t cur_blk = -1;
-    int32_t *tmp_blk_ptr = new int32_t[PM_BLK_SIZE];
 
     if (span_blks == 1) { // 当前窗口完全落在同一个块内
         int32_t base_off = start_blk * PM_BLK_SIZE;
@@ -1509,8 +1494,6 @@ void spread (PMA* pma, Vertex *src, int32_t from, int32_t to, int32_t occupancy)
         refresh_block_meta_range(src, start_blk, end_blk);
     }
     free(tmp_win_arr);
-    delete[] tmp_blk_ptr;
-    // cout << "spread done" << endl;
 }
 
 // PMA 扩容并按新的稀疏布局重排元素。
@@ -1611,6 +1594,33 @@ int load_graph(string path)
     return 0;
 }
 
+// 只扫描边文件元数据。parallel2 流式加载用它拿到顶点上界和边数，
+// 避免把全部 directed edges 常驻到 global_edge_vec。
+int scan_graph_metadata(string path)
+{
+    std::ifstream inputFile(path);
+
+    if (!inputFile) {
+        std::cerr << "Failed to open dataset: " << path << std::endl;
+        return -1;
+    }
+    cout << "Load dataset " << path << endl;
+
+    global_edge_vec.clear();
+    global_edge_vec.shrink_to_fit();
+    global_edge_num = 0;
+    global_max_vid = 0;
+
+    int32_t src, des;
+    while (inputFile >> src >> des) {
+        global_edge_num += 2;
+        global_max_vid = max(global_max_vid, max(src, des));
+    }
+
+    inputFile.close();
+    return 0;
+}
+
 // 基线初始化：每个顶点预分配一个块缓存，所有插入直接进入 PMA。
 void graph_init(int32_t max_vid)
 {
@@ -1704,16 +1714,29 @@ void graph_maintenance_baseline(void)
         if (global_cache_blk >= cache_blk_threshold) {
             // cout << "dump to zone" << endl;
             dumpToZone();
-            global_cache_blk = 0;
         }
     }
     // print_vertex(global_vectex_vec[1]);
     // print_pma(global_vectex_vec[1]);
     
 	double end_t = get_current_time();
+    double total_t = end_t - start_t;
+    double compute_t = total_t - total_dump_time - total_gc_time;
+    if (compute_t < 0.0) {
+        compute_t = 0.0;
+    }
+    last_graph_maintenance_total_time = total_t;
+    last_graph_maintenance_compute_time = compute_t;
     // print_graph();
     // print_pma(global_vectex_vec[1]);
-	cout << "Load graph on NVM baseline time: " << end_t - start_t << endl;
+    cout << "Load graph total time: " << total_t << endl;
+    cout << "Load graph dump count: " << total_dump_count << endl;
+    cout << "Load graph dump total time: " << total_dump_time << endl;
+    cout << "Load graph GC count: " << total_gc_count << endl;
+    cout << "Load graph GC total time: " << total_gc_time << endl;
+    cout << "Load graph GC moved blocks: " << total_gc_moved_blocks << endl;
+    print_atz_gc_summary();
+	cout << "Load graph on NVM baseline time: " << compute_t << endl;
     // print_graph();
 	}
 
@@ -1770,8 +1793,7 @@ static bool graph_insert_directed_edge_locked(int32_t src, int32_t des)
             appendZNSRedoLog(EDGE_LOG_INSERT, src, des);
             bool inserted = cache_insert_unique(v, des);
             if (inserted) {
-                v->update_count++;
-                classify_vertex(v);
+                note_vertex_update(v);
             }
             return inserted;
         }
@@ -1787,8 +1809,7 @@ static bool graph_insert_directed_edge_locked(int32_t src, int32_t des)
         sort(values.begin(), values.end());
         appendZNSRedoLog(EDGE_LOG_INSERT, src, des);
         rebuild_pma_from_sorted_values(v, values);
-        v->update_count++;
-        classify_vertex(v);
+        note_vertex_update(v);
         return true;
     }
 
@@ -1802,13 +1823,15 @@ static bool graph_insert_directed_edge_locked(int32_t src, int32_t des)
     int32_t target_blk = -1;
     if (find_target_block_for_insert(v, des, target_blk)) {
         v->pending_insert_by_block[target_blk].push_back(des);
+        pm_blk &blk = v->blk_list[target_blk];
+        blk.min_val = min(blk.min_val, des);
+        blk.max_val = max(blk.max_val, des);
     } else {
         v->pending_insert_unplaced.push_back(des);
     }
     global_pending_edge_count++;
     v->degree++;
-    v->update_count++;
-    classify_vertex(v);
+    note_vertex_update(v);
     return true;
 }
 
@@ -1860,8 +1883,7 @@ static bool graph_delete_directed_edge_locked(int32_t src, int32_t des)
         }
     }
     if (deleted) {
-        v->update_count++;
-        classify_vertex(v);
+        note_vertex_update(v);
     }
     return deleted;
 }
@@ -1891,6 +1913,109 @@ VertexClass classify_vertex(Vertex *v)
         v->vclass = VERTEX_COLD;
     }
     return v->vclass;
+}
+
+static ATZVertexType classify_atz_vertex(Vertex *v)
+{
+    if (v == nullptr) {
+        return ATZ_VERTEX_COLD;
+    }
+    if (v->temperature >= atz_hot_threshold) {
+        v->atz_type = ATZ_VERTEX_HOT;
+    } else if (v->temperature <= atz_cold_threshold) {
+        v->atz_type = ATZ_VERTEX_COLD;
+    } else {
+        v->atz_type = ATZ_VERTEX_WARM;
+    }
+    return v->atz_type;
+}
+
+static void note_vertex_update(Vertex *v)
+{
+    if (v == nullptr) {
+        return;
+    }
+    v->update_count++;
+    v->recent_updates++;
+    classify_vertex(v);
+}
+
+static const char *atz_vertex_type_name(ATZVertexType type)
+{
+    switch (type) {
+        case ATZ_VERTEX_HOT:
+            return "hot";
+        case ATZ_VERTEX_WARM:
+            return "warm";
+        case ATZ_VERTEX_COLD:
+        default:
+            return "cold";
+    }
+}
+
+static const char *atz_zone_type_name(ATZZoneType type)
+{
+    switch (type) {
+        case ATZ_ZONE_HOT:
+            return "hot";
+        case ATZ_ZONE_WARM:
+            return "warm";
+        case ATZ_ZONE_COLD:
+            return "cold";
+        case ATZ_ZONE_MIXED:
+            return "mixed";
+        case ATZ_ZONE_FREE:
+        default:
+            return "free";
+    }
+}
+
+static void update_vertex_temperatures(void)
+{
+    for (Vertex *v : global_vectex_vec) {
+        if (v == nullptr) {
+            continue;
+        }
+        v->temperature = atz_temperature_alpha * static_cast<double>(v->recent_updates) +
+                         (1.0 - atz_temperature_alpha) * v->temperature;
+        v->recent_updates = 0;
+        classify_atz_vertex(v);
+    }
+    atz_temperature_initialized = true;
+}
+
+static void print_atz_gc_summary(void)
+{
+    if (!global_atz_gc_enabled) {
+        return;
+    }
+    double write_amp = atz_user_write_bytes > 0 ?
+        static_cast<double>(atz_user_write_bytes + atz_gc_write_bytes) /
+        static_cast<double>(atz_user_write_bytes) :
+        0.0;
+    cout << "ATZ GC zone counts hot/warm/mixed/cold/emergency: "
+         << atz_hot_zone_gc_count << "/"
+         << atz_warm_zone_gc_count << "/"
+         << atz_mixed_zone_gc_count << "/"
+         << atz_cold_zone_gc_count << "/"
+         << atz_emergency_gc_count << endl;
+    cout << "ATZ GC migrated hot/warm/cold blocks: "
+         << atz_migrated_hot_blocks << "/"
+         << atz_migrated_warm_blocks << "/"
+         << atz_migrated_cold_blocks << endl;
+    cout << "ATZ GC cold skipped/protected: "
+         << atz_cold_zone_skipped_count << "/"
+         << atz_cold_zone_protected_count << endl;
+    cout << "ATZ GC invalid blocks reclaimed: "
+         << atz_invalid_blocks_reclaimed << endl;
+    cout << "ATZ write bytes user/gc/write_amp: "
+         << atz_user_write_bytes << "/"
+         << atz_gc_write_bytes << "/"
+         << write_amp << endl;
+    cout << "ATZ update writes hot/warm/cold: "
+         << atz_hot_block_update_writes << "/"
+         << atz_warm_block_update_writes << "/"
+         << atz_cold_block_update_writes << endl;
 }
 
 const char *vertex_class_name(VertexClass vclass)
@@ -1935,19 +2060,203 @@ static bool requestBlockFromZoneSetExcluding(const vector<int32_t> &zone_ids,
     return false;
 }
 
-static const vector<int32_t> &zoneIdsForClass(VertexClass vclass)
+struct ATZZoneStats {
+    int32_t valid_blocks = 0;
+    int32_t invalid_blocks = 0;
+    int32_t free_blocks = 0;
+    int32_t written_blocks = 0;
+    int32_t hot_live_blocks = 0;
+    int32_t warm_live_blocks = 0;
+    int32_t cold_live_blocks = 0;
+    double invalid_ratio = 0.0;
+};
+
+static void ensure_atz_zone_types(void)
 {
-    if (vclass == VERTEX_HOT) {
-        return hot_zone_ids;
+    if (global_atz_zone_types.size() != zns.nr_zones) {
+        global_atz_zone_types.assign(zns.nr_zones, ATZ_ZONE_FREE);
     }
-    if (vclass == VERTEX_HUB) {
-        return hub_zone_ids;
+    for (int32_t zone_idx = 0; zone_idx < static_cast<int32_t>(zns.nr_zones); zone_idx++) {
+        if (zone_idx >= global_num_queues) {
+            global_atz_zone_types[zone_idx] = ATZ_ZONE_FREE;
+        }
     }
-    return cold_zone_ids;
+}
+
+static ATZZoneStats compute_atz_zone_stats(int32_t zone_idx)
+{
+    ATZZoneStats stats;
+    if (zone_idx < 0 || zone_idx >= static_cast<int32_t>(global_zone_vec.size())) {
+        return stats;
+    }
+    if (zone_idx < static_cast<int32_t>(global_blk_queues.size())) {
+        lock_guard<std::mutex> lock(global_blk_queues[zone_idx]->mtx_);
+        stats.free_blocks = static_cast<int32_t>(global_blk_queues[zone_idx]->memoryWPs.size());
+    }
+    stats.written_blocks = zns.nr_blocks_perzone - stats.free_blocks;
+    for (int32_t blkidx = 0; blkidx < zns.nr_blocks_perzone; blkidx++) {
+        const blk_info &info = global_zone_vec[zone_idx]->blk_info_vec[blkidx];
+        if (!info.status) {
+            continue;
+        }
+        stats.valid_blocks++;
+        Vertex *v = nullptr;
+        if (info.src >= 0 && info.src < static_cast<int32_t>(global_vectex_vec.size())) {
+            v = global_vectex_vec[info.src];
+        }
+        ATZVertexType vtype = v == nullptr ? ATZ_VERTEX_COLD : classify_atz_vertex(v);
+        if (vtype == ATZ_VERTEX_HOT) {
+            stats.hot_live_blocks++;
+        } else if (vtype == ATZ_VERTEX_WARM) {
+            stats.warm_live_blocks++;
+        } else {
+            stats.cold_live_blocks++;
+        }
+    }
+    stats.invalid_blocks = max(stats.written_blocks - stats.valid_blocks, 0);
+    if (stats.written_blocks > 0) {
+        stats.invalid_ratio =
+            static_cast<double>(stats.invalid_blocks) /
+            static_cast<double>(stats.written_blocks);
+    }
+    return stats;
+}
+
+static vector<int32_t> atz_zones_of_type(ATZZoneType type)
+{
+    vector<int32_t> zones;
+    ensure_atz_zone_types();
+    for (int32_t zone_idx = 0; zone_idx < global_num_queues; zone_idx++) {
+        if (global_atz_zone_types[zone_idx] == type) {
+            zones.push_back(zone_idx);
+        }
+    }
+    return zones;
+}
+
+static bool requestATZBlockFromType(ATZZoneType type,
+                                    int32_t excluded_zone,
+                                    unsigned long long &wp)
+{
+    ensure_atz_zone_types();
+    for (int32_t zone_idx = 0; zone_idx < global_num_queues; zone_idx++) {
+        if (zone_idx == excluded_zone) {
+            continue;
+        }
+        if (global_atz_zone_types[zone_idx] != type &&
+            global_atz_zone_types[zone_idx] != ATZ_ZONE_FREE) {
+            continue;
+        }
+        if (zone_idx >= static_cast<int32_t>(global_blk_queues.size())) {
+            continue;
+        }
+        if (global_blk_queues[zone_idx]->getNextBlock(wp)) {
+            if (global_atz_zone_types[zone_idx] == ATZ_ZONE_FREE) {
+                global_atz_zone_types[zone_idx] = type;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool requestATZBlock(Vertex *v,
+                            int32_t excluded_zone,
+                            bool emergency,
+                            unsigned long long &wp)
+{
+    ATZVertexType vtype = classify_atz_vertex(v);
+    ATZZoneType preferred = ATZ_ZONE_MIXED;
+    if (!atz_temperature_initialized) {
+        preferred = ATZ_ZONE_MIXED;
+    } else if (vtype == ATZ_VERTEX_HOT) {
+        preferred = ATZ_ZONE_HOT;
+    } else if (vtype == ATZ_VERTEX_WARM) {
+        preferred = ATZ_ZONE_WARM;
+    } else {
+        preferred = ATZ_ZONE_COLD;
+    }
+
+    if (requestATZBlockFromType(preferred, excluded_zone, wp)) {
+        return true;
+    }
+    if (vtype == ATZ_VERTEX_HOT && !emergency) {
+        return requestATZBlockFromType(ATZ_ZONE_WARM, excluded_zone, wp) ||
+               requestATZBlockFromType(ATZ_ZONE_MIXED, excluded_zone, wp);
+    }
+    if (vtype == ATZ_VERTEX_COLD && !emergency) {
+        return requestATZBlockFromType(ATZ_ZONE_MIXED, excluded_zone, wp) ||
+               requestATZBlockFromType(ATZ_ZONE_WARM, excluded_zone, wp);
+    }
+    return requestATZBlockFromType(ATZ_ZONE_MIXED, excluded_zone, wp) ||
+           requestATZBlockFromType(ATZ_ZONE_WARM, excluded_zone, wp) ||
+           requestATZBlockFromType(ATZ_ZONE_HOT, excluded_zone, wp) ||
+           requestATZBlockFromType(ATZ_ZONE_COLD, excluded_zone, wp);
+}
+
+static int64_t countFreeBlocksInZoneSet(const vector<int32_t> &zone_ids)
+{
+    int64_t free_blocks = 0;
+    for (int32_t zone_idx : zone_ids) {
+        if (zone_idx < 0 || zone_idx >= static_cast<int32_t>(global_blk_queues.size())) {
+            continue;
+        }
+        lock_guard<std::mutex> lock(global_blk_queues[zone_idx]->mtx_);
+        free_blocks += static_cast<int64_t>(global_blk_queues[zone_idx]->memoryWPs.size());
+    }
+    return free_blocks;
+}
+
+static int64_t countFreeBlocksAllDataZones(void)
+{
+    int64_t free_blocks = 0;
+    for (int32_t zone_idx = 0; zone_idx < global_num_queues; zone_idx++) {
+        if (zone_idx < 0 || zone_idx >= static_cast<int32_t>(global_blk_queues.size())) {
+            continue;
+        }
+        lock_guard<std::mutex> lock(global_blk_queues[zone_idx]->mtx_);
+        free_blocks += static_cast<int64_t>(global_blk_queues[zone_idx]->memoryWPs.size());
+    }
+    return free_blocks;
+}
+
+static void maybe_run_proactive_gc(void)
+{
+    if (global_gc_proactive_free_blocks <= 0 ||
+        global_blk_queues.empty() ||
+        global_num_queues <= 0) {
+        return;
+    }
+    int64_t free_blocks = countFreeBlocksAllDataZones();
+    if (free_blocks > global_gc_proactive_free_blocks) {
+        return;
+    }
+    cout << "Proactive GC trigger: free_blocks=" << free_blocks
+         << " threshold=" << global_gc_proactive_free_blocks << endl;
+    garbage_collection_greedy();
 }
 
 static bool requestRelocationBlock(Vertex *v, int32_t excluded_zone, unsigned long long &wp)
 {
+    if (global_atz_gc_enabled) {
+        bool emergency = false;
+        return requestATZBlock(v, excluded_zone, emergency, wp);
+    }
+
+    if (!global_zone_class_enabled) {
+        for (int32_t zone_idx = 0; zone_idx < global_num_queues; zone_idx++) {
+            if (zone_idx == excluded_zone) {
+                continue;
+            }
+            if (zone_idx >= 0 &&
+                zone_idx < static_cast<int32_t>(global_blk_queues.size()) &&
+                global_blk_queues[zone_idx]->getNextBlock(wp)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     VertexClass vclass = classify_vertex(v);
     if (vclass == VERTEX_HUB &&
         requestBlockFromZoneSetExcluding(hub_zone_ids, excluded_zone, wp)) {
@@ -1996,10 +2305,84 @@ static int32_t chooseVictimZone(const vector<int32_t> &zone_ids)
             continue;
         }
         int32_t valid = countValidBlocksInZone(zone_idx);
-        int32_t invalid = zns.nr_blocks_perzone - valid;
+        int32_t free_blocks = 0;
+        if (zone_idx < static_cast<int32_t>(global_blk_queues.size())) {
+            lock_guard<std::mutex> lock(global_blk_queues[zone_idx]->mtx_);
+            free_blocks = static_cast<int32_t>(global_blk_queues[zone_idx]->memoryWPs.size());
+        }
+        int32_t written = zns.nr_blocks_perzone - free_blocks;
+        int32_t invalid = max(written - valid, 0);
+        if (invalid == 0) {
+            continue;
+        }
         if (invalid > best_invalid) {
             best_invalid = invalid;
             best_zone = zone_idx;
+        }
+    }
+    return best_zone;
+}
+
+static int32_t chooseBasicVictimZone(const vector<int32_t> &zone_ids)
+{
+    for (int32_t zone_idx : zone_ids) {
+        if (zone_idx < 0 || zone_idx >= static_cast<int32_t>(global_zone_vec.size())) {
+            continue;
+        }
+        int32_t valid = countValidBlocksInZone(zone_idx);
+        int32_t free_blocks = 0;
+        if (zone_idx < static_cast<int32_t>(global_blk_queues.size())) {
+            lock_guard<std::mutex> lock(global_blk_queues[zone_idx]->mtx_);
+            free_blocks = static_cast<int32_t>(global_blk_queues[zone_idx]->memoryWPs.size());
+        }
+        int32_t written = zns.nr_blocks_perzone - free_blocks;
+        int32_t invalid = max(written - valid, 0);
+        if (invalid > 0) {
+            return zone_idx;
+        }
+    }
+    return -1;
+}
+
+static int32_t select_victim_zone_atz_gc(bool &emergency_out,
+                                         ATZZoneStats &victim_stats_out,
+                                         bool &cold_protected_out)
+{
+    ensure_atz_zone_types();
+    emergency_out = countFreeBlocksAllDataZones() <= atz_free_zone_emergency_watermark;
+    cold_protected_out = false;
+    int32_t best_zone = -1;
+    double best_score = -1.0;
+    const double epsilon = 1.0;
+
+    for (int32_t zone_idx = 0; zone_idx < global_num_queues; zone_idx++) {
+        ATZZoneType ztype = global_atz_zone_types[zone_idx];
+        if (ztype == ATZ_ZONE_FREE) {
+            continue;
+        }
+        ATZZoneStats stats = compute_atz_zone_stats(zone_idx);
+        if (stats.invalid_blocks == 0 && !emergency_out) {
+            continue;
+        }
+        if (ztype == ATZ_ZONE_COLD &&
+            !emergency_out &&
+            stats.invalid_ratio < atz_cold_gc_threshold) {
+            atz_cold_zone_skipped_count++;
+            atz_cold_zone_protected_count++;
+            cold_protected_out = true;
+            continue;
+        }
+
+        double denominator =
+            static_cast<double>(stats.hot_live_blocks) +
+            static_cast<double>(stats.warm_live_blocks) +
+            atz_cold_live_beta * static_cast<double>(stats.cold_live_blocks) +
+            epsilon;
+        double score = static_cast<double>(stats.invalid_blocks) / denominator;
+        if (score > best_score) {
+            best_score = score;
+            best_zone = zone_idx;
+            victim_stats_out = stats;
         }
     }
     return best_zone;
@@ -2033,11 +2416,18 @@ static void resetZoneMetadataAndQueue(int32_t zone_idx, bool lock_queue = true)
         global_blk_queues[zone_idx]->memoryWPs.push(wp);
         wp += zns_alloc_unit_size();
     }
+    if (global_atz_gc_enabled &&
+        zone_idx >= 0 &&
+        zone_idx < static_cast<int32_t>(global_atz_zone_types.size())) {
+        global_atz_zone_types[zone_idx] = ATZ_ZONE_FREE;
+    }
 }
 
-static bool garbageCollectVictimZone(int32_t victim_zone)
+static bool garbageCollectVictimZone(int32_t victim_zone,
+                                     bool emergency_gc = false,
+                                     bool cold_protected = false,
+                                     const ATZZoneStats *precomputed_stats = nullptr)
 {
-    lock_guard<std::mutex> gc_lock(global_gc_mutex);
     if (victim_zone < 0 || victim_zone >= static_cast<int32_t>(global_zone_vec.size())) {
         return false;
     }
@@ -2045,9 +2435,40 @@ static bool garbageCollectVictimZone(int32_t victim_zone)
         return false;
     }
 
-    cout << "GC victim zone: " << victim_zone << endl;
+    double start_t = get_current_time();
+    auto finish_gc = [&](bool result) {
+        total_gc_time += (get_current_time() - start_t);
+        total_gc_count++;
+        return result;
+    };
+    lock_guard<std::mutex> gc_lock(global_gc_mutex);
+    ATZZoneStats victim_stats =
+        precomputed_stats == nullptr ?
+        compute_atz_zone_stats(victim_zone) :
+        *precomputed_stats;
+    ATZZoneType victim_type =
+        (global_atz_gc_enabled &&
+         victim_zone >= 0 &&
+         victim_zone < static_cast<int32_t>(global_atz_zone_types.size())) ?
+        global_atz_zone_types[victim_zone] :
+        ATZ_ZONE_MIXED;
+    cout << "GC victim zone: " << victim_zone;
+    if (global_atz_gc_enabled) {
+        cout << " type=" << atz_zone_type_name(victim_type)
+             << " invalid=" << victim_stats.invalid_blocks
+             << " valid=" << victim_stats.valid_blocks
+             << " hot_live=" << victim_stats.hot_live_blocks
+             << " warm_live=" << victim_stats.warm_live_blocks
+             << " cold_live=" << victim_stats.cold_live_blocks
+             << " emergency=" << (emergency_gc ? 1 : 0)
+             << " cold_protected=" << (cold_protected ? 1 : 0);
+    }
+    cout << endl;
     unique_lock<std::mutex> victim_queue_lock(global_blk_queues[victim_zone]->mtx_);
     int32_t moved = 0;
+    int32_t moved_hot = 0;
+    int32_t moved_warm = 0;
+    int32_t moved_cold = 0;
     int32_t *array = nullptr;
     unsigned long long rp = static_cast<unsigned long long>(victim_zone) * zns.zone_size;
     beginZNSEpoch();
@@ -2060,7 +2481,7 @@ static bool garbageCollectVictimZone(int32_t victim_zone)
                 cout << "GC abort: busy vertex " << info.src << endl;
                 commitZNSEpoch();
                 delete[] array;
-                return false;
+                return finish_gc(false);
             }
             blk_info cur_info = global_zone_vec[victim_zone]->blk_info_vec[blkidx];
             if (!cur_info.status || cur_info.src != info.src ||
@@ -2072,9 +2493,10 @@ static bool garbageCollectVictimZone(int32_t victim_zone)
             if (!requestRelocationBlock(v, victim_zone, new_wp)) {
                 commitZNSEpoch();
                 delete[] array;
-                return false;
+                return finish_gc(false);
             }
 
+            ATZVertexType vtype = classify_atz_vertex(v);
             readBlockFromZone(zns.dev_fd, array, PM_BLK_SIZE, rp);
             refresh_pm_blk_meta(v->blk_list[info.blkIndex], array);
             if (global_zns_record_enabled) {
@@ -2087,6 +2509,15 @@ static bool garbageCollectVictimZone(int32_t victim_zone)
             global_zone_vec[victim_zone]->blk_info_vec[blkidx].status = false;
             mark_zone(info.src, info.blkIndex, new_wp);
             moved++;
+            if (global_atz_gc_enabled) {
+                if (vtype == ATZ_VERTEX_HOT) {
+                    moved_hot++;
+                } else if (vtype == ATZ_VERTEX_WARM) {
+                    moved_warm++;
+                } else {
+                    moved_cold++;
+                }
+            }
         }
         rp += zns_alloc_unit_size();
     }
@@ -2095,45 +2526,88 @@ static bool garbageCollectVictimZone(int32_t victim_zone)
 
     resetZoneMetadataAndQueue(victim_zone, false);
     cout << "GC moved blocks: " << moved << endl;
-    return true;
+    total_gc_moved_blocks += moved;
+    if (global_atz_gc_enabled) {
+        atz_gc_write_bytes += static_cast<int64_t>(moved) *
+                              static_cast<int64_t>(zns_alloc_unit_size());
+        atz_migrated_hot_blocks += moved_hot;
+        atz_migrated_warm_blocks += moved_warm;
+        atz_migrated_cold_blocks += moved_cold;
+        atz_invalid_blocks_reclaimed += victim_stats.invalid_blocks;
+        if (emergency_gc) {
+            atz_emergency_gc_count++;
+        }
+        if (victim_type == ATZ_ZONE_HOT) {
+            atz_hot_zone_gc_count++;
+        } else if (victim_type == ATZ_ZONE_WARM) {
+            atz_warm_zone_gc_count++;
+        } else if (victim_type == ATZ_ZONE_COLD) {
+            atz_cold_zone_gc_count++;
+        } else {
+            atz_mixed_zone_gc_count++;
+        }
+        cout << "ATZ GC migrated hot=" << moved_hot
+             << " warm=" << moved_warm
+             << " cold=" << moved_cold
+             << " reclaimed_invalid=" << victim_stats.invalid_blocks << endl;
+    }
+    return finish_gc(true);
 }
 
-bool garbage_collection_by_mode(VertexClass requested_class)
+bool garbage_collection_greedy(void)
 {
-    if (!global_zone_class_enabled || global_blk_queues.empty()) {
+    if (global_blk_queues.empty()) {
         return garbage_collection();
     }
 
-    int32_t victim = -1;
-    vector<int32_t> all_class_zones;
-    all_class_zones.insert(all_class_zones.end(), hot_zone_ids.begin(), hot_zone_ids.end());
-    all_class_zones.insert(all_class_zones.end(), cold_zone_ids.begin(), cold_zone_ids.end());
-    all_class_zones.insert(all_class_zones.end(), hub_zone_ids.begin(), hub_zone_ids.end());
-
-    if (global_gc_mode == GC_GLOBAL) {
-        victim = chooseVictimZone(all_class_zones);
-        return victim >= 0 && garbageCollectVictimZone(victim);
+    if (global_atz_gc_enabled) {
+        update_vertex_temperatures();
+        bool emergency = false;
+        bool cold_protected = false;
+        ATZZoneStats stats;
+        int32_t victim = select_victim_zone_atz_gc(emergency, stats, cold_protected);
+        return victim >= 0 && garbageCollectVictimZone(victim,
+                                                       emergency,
+                                                       cold_protected,
+                                                       &stats);
     }
 
-    if (global_gc_mode == GC_CLASS_LOCAL) {
-        victim = chooseVictimZone(zoneIdsForClass(requested_class));
-        if (victim >= 0 && garbageCollectVictimZone(victim)) {
-            return true;
+    vector<int32_t> candidate_zones;
+    if (global_zone_class_enabled) {
+        candidate_zones.insert(candidate_zones.end(), hot_zone_ids.begin(), hot_zone_ids.end());
+        candidate_zones.insert(candidate_zones.end(), cold_zone_ids.begin(), cold_zone_ids.end());
+        candidate_zones.insert(candidate_zones.end(), hub_zone_ids.begin(), hub_zone_ids.end());
+    } else {
+        for (int32_t zone_idx = 0; zone_idx < global_num_queues; zone_idx++) {
+            candidate_zones.push_back(zone_idx);
         }
     }
 
-    if (global_gc_mode == GC_CLASS_AWARE || global_gc_mode == GC_CLASS_LOCAL) {
-        victim = chooseVictimZone(all_class_zones);
-        if (victim >= 0 && garbageCollectVictimZone(victim)) {
-            return true;
-        }
-    }
-
-    return false;
+    int32_t victim = global_basic_gc_enabled ?
+        chooseBasicVictimZone(candidate_zones) :
+        chooseVictimZone(candidate_zones);
+    return victim >= 0 && garbageCollectVictimZone(victim);
 }
 
 bool requestClassifiedBlock(Vertex *v, unsigned long long &wp)
 {
+    if (global_atz_gc_enabled) {
+        bool emergency = countFreeBlocksAllDataZones() <= atz_free_zone_emergency_watermark;
+        bool ok = requestATZBlock(v, -1, emergency, wp);
+        if (ok) {
+            ATZVertexType type = classify_atz_vertex(v);
+            if (type == ATZ_VERTEX_HOT) {
+                atz_hot_block_update_writes++;
+            } else if (type == ATZ_VERTEX_WARM) {
+                atz_warm_block_update_writes++;
+            } else {
+                atz_cold_block_update_writes++;
+            }
+            atz_user_write_bytes += static_cast<int64_t>(zns_alloc_unit_size());
+        }
+        return ok;
+    }
+
     VertexClass vclass = classify_vertex(v);
     if (vclass == VERTEX_HUB && requestBlockFromZoneSet(hub_zone_ids, wp)) {
         return true;
@@ -2160,7 +2634,7 @@ bool requestClassifiedBlock(Vertex *v, unsigned long long &wp)
     if (resume_epoch) {
         commitZNSEpoch();
     }
-    bool gc_ok = garbage_collection_by_mode(vclass);
+    bool gc_ok = garbage_collection_greedy();
     if (resume_epoch) {
         beginZNSEpoch();
     }
@@ -2211,19 +2685,30 @@ void graph_maintenance_new(void)
                 cout << "dump to zone" << endl;
             }
             dumpToZone();
-            global_cache_blk = 0;
         }
     }
 
-    dumpToZone();
-    global_cache_blk = 0;
     // print_vertex(global_vectex_vec[1]);
     // print_pma(global_vectex_vec[1]);
     
 	double end_t = get_current_time();
+    double total_t = end_t - start_t;
+    double compute_t = total_t - total_dump_time - total_gc_time;
+    if (compute_t < 0.0) {
+        compute_t = 0.0;
+    }
+    last_graph_maintenance_total_time = total_t;
+    last_graph_maintenance_compute_time = compute_t;
     // print_graph();
     // print_pma(global_vectex_vec[1]);
-	cout << "Load graph on NVM new time: " << end_t - start_t << endl;
+    cout << "Load graph total time: " << total_t << endl;
+    cout << "Load graph dump count: " << total_dump_count << endl;
+    cout << "Load graph dump total time: " << total_dump_time << endl;
+    cout << "Load graph GC count: " << total_gc_count << endl;
+    cout << "Load graph GC total time: " << total_gc_time << endl;
+    cout << "Load graph GC moved blocks: " << total_gc_moved_blocks << endl;
+    print_atz_gc_summary();
+	cout << "Load graph on NVM new time: " << compute_t << endl;
     // print_graph();
 }
 
@@ -2256,7 +2741,6 @@ void graph_maintenance_parallel(void)
                 cout << "dump to zone" << endl;
             }
             dumpToZone();
-            global_cache_blk = 0;
         }
 
         if (end_e == global_edge_num) {
@@ -2266,10 +2750,22 @@ void graph_maintenance_parallel(void)
         end_e = min(start_e + global_batch_size, global_edge_num);
     }
 
-    dumpToZone();
-    global_cache_blk = 0;
 	double end_t = get_current_time();
-	cout << "Load graph on NVM new time: " << end_t - start_t << endl;
+    double total_t = end_t - start_t;
+    double compute_t = total_t - total_dump_time - total_gc_time;
+    if (compute_t < 0.0) {
+        compute_t = 0.0;
+    }
+    last_graph_maintenance_total_time = total_t;
+    last_graph_maintenance_compute_time = compute_t;
+    cout << "Load graph total time: " << total_t << endl;
+    cout << "Load graph dump count: " << total_dump_count << endl;
+    cout << "Load graph dump total time: " << total_dump_time << endl;
+    cout << "Load graph GC count: " << total_gc_count << endl;
+    cout << "Load graph GC total time: " << total_gc_time << endl;
+    cout << "Load graph GC moved blocks: " << total_gc_moved_blocks << endl;
+    print_atz_gc_summary();
+	cout << "Load graph on NVM new time: " << compute_t << endl;
     // print_graph();
 }
 
@@ -2278,7 +2774,7 @@ void graph_maintenance_parallel2(void)
 {
     /*
         并行插入 + 并行刷盘版本：
-        当前默认将整个数据集作为一个 batch，在 batch 结束后统一并行刷盘。
+        每个 batch 结束后检查脏 PMA block 数量，达到阈值才刷盘。
     */
     graph_init_new2(global_max_vid);
     cout << "Load graph on NVM new begin!" << endl;
@@ -2287,7 +2783,6 @@ void graph_maintenance_parallel2(void)
     // batch 结束后检查缓存块数量，达到阈值则并行刷盘
     omp_set_num_threads(THREAD_NUM);
     int64_t start_e = 0;
-    global_batch_size = global_edge_num;
     int64_t end_e = min(start_e + global_batch_size, global_edge_num);
     
     while (end_e <= global_edge_num) {
@@ -2302,14 +2797,7 @@ void graph_maintenance_parallel2(void)
         if (global_cache_blk >= cache_blk_threshold) {
             // cout << "dump to zone" << endl;
             dumpToZoneParallel();
-            global_cache_blk = 0;
         }
-
-        // if ((end_e % (global_batch_size * 10)) == 0)
-        // {
-        //     garbage_collection_new();
-        // }
-        
 
         if (end_e == global_edge_num) {
             break;
@@ -2317,11 +2805,109 @@ void graph_maintenance_parallel2(void)
         start_e = end_e;
         end_e = min(start_e + global_batch_size, global_edge_num);
     }
-    dumpToZoneParallel();
-    global_cache_blk = 0;
 	double end_t = get_current_time();
-	cout << "Load graph on NVM new time: " << end_t - start_t << endl;
+    double total_t = end_t - start_t;
+    double compute_t = total_t - total_dump_time - total_gc_time;
+    if (compute_t < 0.0) {
+        compute_t = 0.0;
+    }
+    last_graph_maintenance_total_time = total_t;
+    last_graph_maintenance_compute_time = compute_t;
+    cout << "Load graph total time: " << total_t << endl;
+    cout << "Load graph dump count: " << total_dump_count << endl;
+    cout << "Load graph dump total time: " << total_dump_time << endl;
+    cout << "Load graph GC count: " << total_gc_count << endl;
+    cout << "Load graph GC total time: " << total_gc_time << endl;
+    cout << "Load graph GC moved blocks: " << total_gc_moved_blocks << endl;
+    print_atz_gc_summary();
+	cout << "Load graph on NVM new time: " << compute_t << endl;
     // print_graph();
+}
+
+void graph_maintenance_parallel2_streaming(const string &path)
+{
+    /*
+        parallel2 的流式构图路径：
+        文件预扫描只确定 global_max_vid/global_edge_num，正式加载时按 batch
+        读入少量 directed edges，插入完成后立即释放 batch。
+    */
+    graph_init_new2(global_max_vid);
+    cout << "Load graph on NVM new begin!" << endl;
+	double start_t = get_current_time();
+
+    std::ifstream inputFile(path);
+    if (!inputFile) {
+        std::cerr << "Failed to open dataset: " << path << std::endl;
+        exit(EXIT_FAILURE);
+    }
+
+    omp_set_num_threads(THREAD_NUM);
+    vector<new_edge> edge_batch;
+    edge_batch.reserve(global_batch_size);
+    int64_t processed_edges = 0;
+
+    auto flush_batch = [&]() {
+        if (edge_batch.empty()) {
+            return;
+        }
+
+        int64_t batch_size = static_cast<int64_t>(edge_batch.size());
+        #pragma omp parallel for
+        for (int64_t edgeIdx = 0; edgeIdx < batch_size; edgeIdx++) {
+            new_edge e = edge_batch[edgeIdx];
+            graph_insert_directed_edge(e.src, e.des);
+        }
+
+        processed_edges += batch_size;
+        edge_batch.clear();
+
+        if (global_cache_blk >= cache_blk_threshold) {
+            dumpToZoneParallel();
+        }
+    };
+
+    int32_t src, des;
+    while (inputFile >> src >> des) {
+        new_edge e1;
+        e1.src = src;
+        e1.des = des;
+        edge_batch.push_back(e1);
+        if (static_cast<int64_t>(edge_batch.size()) >= global_batch_size) {
+            flush_batch();
+        }
+
+        new_edge e2;
+        e2.src = des;
+        e2.des = src;
+        edge_batch.push_back(e2);
+        if (static_cast<int64_t>(edge_batch.size()) >= global_batch_size) {
+            flush_batch();
+        }
+    }
+    flush_batch();
+    inputFile.close();
+
+    if (processed_edges != global_edge_num) {
+        cerr << "Warning: streamed edge count " << processed_edges
+             << " differs from scanned edge count " << global_edge_num << endl;
+    }
+
+	double end_t = get_current_time();
+    double total_t = end_t - start_t;
+    double compute_t = total_t - total_dump_time - total_gc_time;
+    if (compute_t < 0.0) {
+        compute_t = 0.0;
+    }
+    last_graph_maintenance_total_time = total_t;
+    last_graph_maintenance_compute_time = compute_t;
+    cout << "Load graph total time: " << total_t << endl;
+    cout << "Load graph dump count: " << total_dump_count << endl;
+    cout << "Load graph dump total time: " << total_dump_time << endl;
+    cout << "Load graph GC count: " << total_gc_count << endl;
+    cout << "Load graph GC total time: " << total_gc_time << endl;
+    cout << "Load graph GC moved blocks: " << total_gc_moved_blocks << endl;
+    print_atz_gc_summary();
+	cout << "Load graph on NVM new time: " << compute_t << endl;
 }
 
 void print_vertex(int32_t vid, int64_t &total_edges)
@@ -2412,13 +2998,8 @@ void print_vertex_pma_blocks(int32_t vid)
             loaded_from_zone = true;
         }
 
-        cout << "  blk[" << blkidx << "] wp=";
-        if (loaded_from_zone) {
-            cout << v->blk_list[blkidx].global_wp;
-        } else {
-            cout << "unassigned";
-        }
-        cout << " source=" << (loaded_from_zone ? "zone" : "dram")
+        cout << "  blk[" << blkidx << "] wp=" << v->blk_list[blkidx].global_wp
+             << " source=" << (loaded_from_zone ? "zone" : "dram")
              << " values=[";
         for (int32_t i = 0; i < PM_BLK_SIZE; i++) {
             cout << blk_ptr[i];
@@ -2586,6 +3167,7 @@ void dumpToZone(void)
     // int total_blks = 0;
     shared_lock<std::shared_timed_mutex> graph_lock(global_query_update_mutex);
     double start_t = get_current_time();
+    int64_t dumped_blocks = 0;
     beginZNSEpoch();
     for (int32_t vidx = 0; vidx < global_vectex_vec.size(); vidx++) {
         Vertex *v = global_vectex_vec[vidx];
@@ -2638,6 +3220,7 @@ void dumpToZone(void)
                 // v->blk_list[blkidx].global_wp = new_blk.global_wp;
 
                 global_cache_blk--;
+                dumped_blocks++;
             }
         }
     }
@@ -2646,6 +3229,11 @@ void dumpToZone(void)
     if (!global_debug_pending_merge) {
         cout << "Dump to zone time: " << end_t - start_t << endl;
     }
+    if (dumped_blocks > 0) {
+        total_dump_time += (end_t - start_t);
+        total_dump_count++;
+    }
+    maybe_run_proactive_gc();
     // cout << "total_blks: " << total_blks << endl;
 }
 
@@ -2658,6 +3246,68 @@ void dumpToZoneParallel(void)
     dumpToZoneZoneSerial();
 }
 
+struct ZoneWriteBatch {
+    bool active = false;
+    unsigned long long start_wp = 0;
+    vector<char> data;
+};
+
+static void appendGraphBlockToZoneBatch(vector<ZoneWriteBatch> &batches,
+                                        Vertex *v,
+                                        int32_t blkidx,
+                                        unsigned long long wp)
+{
+    int32_t zone_idx = static_cast<int32_t>(wp / static_cast<unsigned long long>(zns.zone_size));
+    if (zone_idx < 0 || zone_idx >= static_cast<int32_t>(batches.size())) {
+        std::cerr << "Invalid zone for batched dump wp=" << wp << std::endl;
+        exit(EXIT_FAILURE);
+    }
+
+    ZoneWriteBatch &batch = batches[zone_idx];
+    if (!batch.active) {
+        batch.active = true;
+        batch.start_wp = wp;
+    }
+    unsigned long long expected_wp =
+        batch.start_wp + static_cast<unsigned long long>(batch.data.size());
+    if (wp != expected_wp) {
+        std::cerr << "Non-contiguous batched dump write: zone=" << zone_idx
+                  << " expected_wp=" << expected_wp
+                  << " actual_wp=" << wp << std::endl;
+        exit(EXIT_FAILURE);
+    }
+
+    size_t old_size = batch.data.size();
+    batch.data.resize(old_size + zns_alloc_unit_size(), 0);
+    if (global_zns_record_enabled) {
+        buildZNSRecord(batch.data.data() + old_size,
+                       v->id,
+                       blkidx,
+                       v->pma,
+                       v->blk_list[blkidx].buf,
+                       PM_BLK_SIZE);
+    } else {
+        memcpy(batch.data.data() + old_size,
+               v->blk_list[blkidx].buf,
+               PM_BLK_SIZE * sizeof(int32_t));
+    }
+}
+
+static void flushZoneWriteBatches(vector<ZoneWriteBatch> &batches)
+{
+    for (int32_t zone_idx = 0; zone_idx < static_cast<int32_t>(batches.size()); zone_idx++) {
+        ZoneWriteBatch &batch = batches[zone_idx];
+        if (!batch.active || batch.data.empty()) {
+            continue;
+        }
+        checkedZoneWriteBatch(zns.dev_fd,
+                              batch.data.data(),
+                              batch.data.size(),
+                              batch.start_wp,
+                              "Failed to write batched ZNS records");
+    }
+}
+
 void dumpToZoneZoneSerial(void)
 {
     if (global_blk_queues.empty() || global_num_queues <= 0) {
@@ -2667,7 +3317,9 @@ void dumpToZoneZoneSerial(void)
 
     shared_lock<std::shared_timed_mutex> graph_lock(global_query_update_mutex);
     double start_t = get_current_time();
+    int64_t dumped_blocks = 0;
     beginZNSEpoch();
+    vector<ZoneWriteBatch> zone_batches(zns.nr_zones);
     int next_zone = 0;
     for (int32_t vidx = 0; vidx < static_cast<int32_t>(global_vectex_vec.size()); vidx++) {
         Vertex *v = global_vectex_vec[vidx];
@@ -2698,21 +3350,27 @@ void dumpToZoneZoneSerial(void)
                 }
 
                 refresh_pm_blk_meta(v->blk_list[blkidx], v->blk_list[blkidx].buf);
-                writeGraphBlockToZone(v, blkidx, wp);
+                appendGraphBlockToZoneBatch(zone_batches, v, blkidx, wp);
                 delete[] v->blk_list[blkidx].buf;
                 mark_zone(v->id, blkidx, wp);
                 v->blk_list[blkidx].buf = nullptr;
                 v->blk_list[blkidx].global_wp = wp;
                 global_cache_blk--;
+                dumped_blocks++;
             }
         }
     }
+    flushZoneWriteBatches(zone_batches);
     commitZNSEpoch();
     double end_t = get_current_time();
     if (!global_debug_pending_merge) {
         cout << "Dump to zone-serial writer time: " << end_t - start_t << endl;
     }
-    total_dump_time += (end_t - start_t);
+    if (dumped_blocks > 0) {
+        total_dump_time += (end_t - start_t);
+        total_dump_count++;
+    }
+    maybe_run_proactive_gc();
 }
 
 static bool request_any_record_block(Vertex *v, unsigned long long &wp)
@@ -2737,7 +3395,7 @@ static bool request_any_record_block(Vertex *v, unsigned long long &wp)
     if (resume_epoch) {
         commitZNSEpoch();
     }
-    garbage_collection_by_mode(VERTEX_COLD);
+    garbage_collection_greedy();
     if (resume_epoch) {
         beginZNSEpoch();
     }
@@ -2758,6 +3416,7 @@ void persist_cache_vertices_as_records(void)
 
     shared_lock<std::shared_timed_mutex> graph_lock(global_query_update_mutex);
     beginZNSEpoch();
+    vector<ZoneWriteBatch> zone_batches(zns.nr_zones);
     for (int32_t vidx = 0; vidx < static_cast<int32_t>(global_vectex_vec.size()); vidx++) {
         Vertex *v = global_vectex_vec[vidx];
         unique_lock<std::shared_timed_mutex> lock(v->mutex);
@@ -2781,13 +3440,120 @@ void persist_cache_vertices_as_records(void)
             std::cerr << "No free block to persist cache vertex record." << std::endl;
             exit(EXIT_FAILURE);
         }
-        writeGraphBlockToZone(v, 0, wp);
+        appendGraphBlockToZoneBatch(zone_batches, v, 0, wp);
         delete[] v->blk_list[0].buf;
         v->blk_list[0].buf = nullptr;
         v->blk_list[0].global_wp = wp;
         mark_zone(v->id, 0, wp);
     }
+    flushZoneWriteBatches(zone_batches);
     commitZNSEpoch();
+}
+
+static void print_size_line(const char *name, size_t bytes)
+{
+    double mib = static_cast<double>(bytes) / (1024.0 * 1024.0);
+    cout << name << ": " << bytes << " bytes (" << mib << " MiB)" << endl;
+}
+
+void print_dram_metadata_usage(void)
+{
+    size_t vertex_ptr_array_bytes = global_vectex_vec.capacity() * sizeof(Vertex *);
+    size_t vertex_object_bytes = 0;
+    size_t pma_object_bytes = 0;
+    size_t blk_list_meta_bytes = 0;
+    size_t pending_dynamic_bytes = 0;
+    size_t cached_block_payload_bytes = 0;
+    size_t cache_buf_bytes = 0;
+    size_t nonnull_vertices = 0;
+    size_t pma_block_meta_count = 0;
+    size_t cached_block_count = 0;
+    size_t pending_edge_capacity = 0;
+
+    for (Vertex *v : global_vectex_vec) {
+        if (v == nullptr) {
+            continue;
+        }
+        nonnull_vertices++;
+        vertex_object_bytes += sizeof(Vertex);
+        cache_buf_bytes += sizeof(v->cache_buf);
+        if (v->pma != nullptr) {
+            pma_object_bytes += sizeof(PMA);
+        }
+
+        blk_list_meta_bytes += v->blk_list.capacity() * sizeof(pm_blk);
+        pma_block_meta_count += v->blk_list.size();
+        for (const pm_blk &blk : v->blk_list) {
+            if (blk.buf != nullptr) {
+                cached_block_count++;
+                cached_block_payload_bytes += PM_BLK_SIZE * sizeof(int32_t);
+            }
+        }
+
+        pending_dynamic_bytes += v->pending_insert_unplaced.capacity() * sizeof(int32_t);
+        pending_edge_capacity += v->pending_insert_unplaced.capacity();
+        pending_dynamic_bytes += v->pending_insert_by_block.bucket_count() * sizeof(void *);
+        for (const auto &entry : v->pending_insert_by_block) {
+            pending_dynamic_bytes += sizeof(entry);
+            pending_dynamic_bytes += entry.second.capacity() * sizeof(int32_t);
+            pending_edge_capacity += entry.second.capacity();
+        }
+    }
+
+    size_t zone_metadata_bytes = global_zone_vec.capacity() * sizeof(ZoneStatus *);
+    for (ZoneStatus *zone : global_zone_vec) {
+        if (zone == nullptr) {
+            continue;
+        }
+        zone_metadata_bytes += sizeof(ZoneStatus);
+        zone_metadata_bytes += zone->blk_info_vec.capacity() * sizeof(blk_info);
+    }
+    zone_metadata_bytes += global_zone_write_wp.capacity() * sizeof(unsigned long long);
+    zone_metadata_bytes += global_zone_write_limit.capacity() * sizeof(unsigned long long);
+    zone_metadata_bytes += hot_zone_ids.capacity() * sizeof(int32_t);
+    zone_metadata_bytes += cold_zone_ids.capacity() * sizeof(int32_t);
+    zone_metadata_bytes += hub_zone_ids.capacity() * sizeof(int32_t);
+
+    size_t free_wp_queue_payload_bytes = global_blk_queues.capacity() * sizeof(MemoryWPQueue *);
+    for (MemoryWPQueue *queue : global_blk_queues) {
+        if (queue == nullptr) {
+            continue;
+        }
+        free_wp_queue_payload_bytes += sizeof(MemoryWPQueue);
+        free_wp_queue_payload_bytes += queue->memoryWPs.size() * sizeof(unsigned long long);
+    }
+
+    size_t input_edge_vec_bytes = global_edge_vec.capacity() * sizeof(new_edge);
+    size_t graph_metadata_bytes = vertex_ptr_array_bytes +
+                                  vertex_object_bytes +
+                                  pma_object_bytes +
+                                  blk_list_meta_bytes +
+                                  pending_dynamic_bytes +
+                                  zone_metadata_bytes +
+                                  free_wp_queue_payload_bytes;
+
+    size_t graph_metadata_excluding_cache_buf =
+        graph_metadata_bytes >= cache_buf_bytes ?
+        graph_metadata_bytes - cache_buf_bytes :
+        graph_metadata_bytes;
+
+    cout << "==== DRAM metadata usage estimate ====" << endl;
+    cout << "nonnull vertices: " << nonnull_vertices << endl;
+    cout << "PMA block metadata entries: " << pma_block_meta_count << endl;
+    cout << "cached PMA block payload count excluded: " << cached_block_count << endl;
+    cout << "pending edge capacity: " << pending_edge_capacity << endl;
+    print_size_line("vertex pointer array", vertex_ptr_array_bytes);
+    print_size_line("Vertex objects", vertex_object_bytes);
+    print_size_line("  cache_buf inside Vertex", cache_buf_bytes);
+    print_size_line("PMA objects", pma_object_bytes);
+    print_size_line("blk_list metadata arrays", blk_list_meta_bytes);
+    print_size_line("pending dynamic containers", pending_dynamic_bytes);
+    print_size_line("zone/free-block metadata", zone_metadata_bytes + free_wp_queue_payload_bytes);
+    print_size_line("graph metadata total, excluding PMA block payload", graph_metadata_bytes);
+    print_size_line("graph metadata total, also excluding cache_buf", graph_metadata_excluding_cache_buf);
+    print_size_line("excluded cached PMA block payload", cached_block_payload_bytes);
+    print_size_line("input global_edge_vec, not graph metadata", input_edge_vec_bytes);
+    cout << "==== end DRAM metadata usage estimate ====" << endl;
 }
 
 struct RecoveredRecord {
@@ -2809,6 +3575,52 @@ static bool epoch_stats_match(const ZNSBlockHeader &commit,
            commit.last_seq == stats.last_seq &&
            commit.data_record_count == stats.data_record_count &&
            commit.aggregate_checksum == stats.aggregate_checksum;
+}
+
+static uint64_t recovered_record_key(int32_t vid, int32_t blk_idx)
+{
+    return (static_cast<uint64_t>(static_cast<uint32_t>(vid)) << 32) |
+           static_cast<uint32_t>(blk_idx);
+}
+
+static void refresh_recovered_pma_shape(Vertex *v)
+{
+    if (v == nullptr || v->pma == nullptr) {
+        return;
+    }
+    v->pma->seg_len = BLOCK_ALIGNED_SEG_LEN;
+    int32_t min_cap = max(v->pma->seg_len * 2, v->pma->arr_cap);
+    v->pma->seg_num = hyperceil(ceil_div(min_cap, v->pma->seg_len));
+    v->pma->arr_cap = v->pma->seg_len * v->pma->seg_num;
+    v->pma->tree_h = floor_lg(v->pma->seg_num) + 1;
+    v->pma->delta_t = (t_0 - t_h) / v->pma->tree_h;
+    v->pma->delta_p = (p_h - p_0) / v->pma->tree_h;
+}
+
+static uint64_t materialize_missing_recovered_blocks(const unordered_set<uint64_t> &recovered_keys)
+{
+    uint64_t missing_blocks = 0;
+    for (Vertex *v : global_vectex_vec) {
+        if (v == nullptr || v->pma == nullptr || v->blk_list.empty()) {
+            continue;
+        }
+        for (int32_t blk_idx = 0; blk_idx < static_cast<int32_t>(v->blk_list.size()); blk_idx++) {
+            if (recovered_keys.find(recovered_record_key(v->id, blk_idx)) != recovered_keys.end()) {
+                continue;
+            }
+            if (v->blk_list[blk_idx].buf != nullptr) {
+                continue;
+            }
+            v->blk_list[blk_idx].buf = new int32_t[PM_BLK_SIZE];
+            fill(v->blk_list[blk_idx].buf,
+                 v->blk_list[blk_idx].buf + PM_BLK_SIZE,
+                 -1);
+            reset_pm_blk_meta(v->blk_list[blk_idx]);
+            global_cache_blk++;
+            missing_blocks++;
+        }
+    }
+    return missing_blocks;
 }
 
 static void ensure_recovered_vertex_capacity(int32_t vid)
@@ -2858,6 +3670,217 @@ static uint64_t replay_redo_logs_after(uint64_t committed_op_id,
     return replayed;
 }
 
+static bool read_redo_log_file_records(vector<EdgeLogRecord> &records,
+                                       uint64_t &records_valid,
+                                       uint64_t &max_op_id,
+                                       int32_t &max_vid)
+{
+    records_valid = 0;
+    if (!global_redo_file_enabled || global_redo_log_file_path.empty()) {
+        return false;
+    }
+    ifstream input(global_redo_log_file_path, ios::binary);
+    if (!input.good()) {
+        return false;
+    }
+
+    EdgeLogEntry entry;
+    while (input.read(reinterpret_cast<char *>(&entry), sizeof(entry))) {
+        if (entry.op_type != EDGE_LOG_INSERT &&
+            entry.op_type != EDGE_LOG_DELETE) {
+            records.clear();
+            return false;
+        }
+        EdgeLogRecord record;
+        memset(&record, 0, sizeof(record));
+        record.magic = ZNS_REDO_MAGIC;
+        record.version = ZNS_BLOCK_VERSION;
+        record.op_type = entry.op_type;
+        record.op_id = entry.op_id;
+        record.src = entry.src;
+        record.dst = entry.dst;
+        record.tail_magic = ZNS_REDO_TAIL_MAGIC;
+        record.checksum = zns_redo_checksum(record);
+        records.push_back(record);
+        records_valid++;
+        max_op_id = max(max_op_id, record.op_id);
+        max_vid = max(max_vid, max(record.src, record.dst));
+    }
+    if (!input.eof()) {
+        records.clear();
+        records_valid = 0;
+        return false;
+    }
+    sort(records.begin(), records.end(),
+         [](const EdgeLogRecord &a, const EdgeLogRecord &b) {
+             return a.op_id < b.op_id;
+         });
+    return records_valid > 0;
+}
+
+static unsigned long long recovery_zone_scan_limit(int32_t zone_idx)
+{
+    unsigned long long zone_start =
+        static_cast<unsigned long long>(zone_idx) *
+        static_cast<unsigned long long>(zns.zone_size);
+    unsigned long long zone_end = zone_start + zns.zone_size;
+    if (zone_idx >= 0 &&
+        zone_idx < static_cast<int32_t>(global_zone_write_wp.size()) &&
+        global_zone_write_wp[zone_idx] >= zone_start) {
+        return min(global_zone_write_wp[zone_idx], zone_end);
+    }
+    return zone_end;
+}
+
+struct RecoverySampleVertex {
+    int32_t vid = -1;
+    vector<int32_t> neighbors;
+};
+
+static vector<RecoverySampleVertex> build_recovery_validation_sample(size_t sample_limit)
+{
+    vector<pair<int32_t, int32_t>> candidates;
+    candidates.reserve(global_vectex_vec.size());
+    for (Vertex *v : global_vectex_vec) {
+        if (v == nullptr || v->degree <= 0) {
+            continue;
+        }
+        candidates.push_back({v->degree, v->id});
+    }
+    sort(candidates.begin(), candidates.end(), greater<pair<int32_t, int32_t>>());
+
+    vector<int32_t> selected;
+    unordered_set<int32_t> selected_set;
+    size_t top_count = min(sample_limit / 2, candidates.size());
+    for (size_t i = 0; i < top_count; i++) {
+        selected.push_back(candidates[i].second);
+        selected_set.insert(candidates[i].second);
+    }
+
+    if (!candidates.empty()) {
+        size_t remaining = sample_limit > selected.size() ?
+            sample_limit - selected.size() : 0;
+        size_t step = max<size_t>(1, candidates.size() / max<size_t>(remaining, 1));
+        for (size_t i = 0; i < candidates.size() && selected.size() < sample_limit; i += step) {
+            int32_t vid = candidates[i].second;
+            if (selected_set.insert(vid).second) {
+                selected.push_back(vid);
+            }
+        }
+    }
+
+    vector<RecoverySampleVertex> sample;
+    sample.reserve(selected.size());
+    for (int32_t vid : selected) {
+        if (vid < 0 || vid >= static_cast<int32_t>(global_vectex_vec.size())) {
+            continue;
+        }
+        Vertex *v = global_vectex_vec[vid];
+        if (v == nullptr) {
+            continue;
+        }
+        RecoverySampleVertex entry;
+        entry.vid = vid;
+        collect_vertex_neighbors_for_debug(v, entry.neighbors);
+        sample.push_back(std::move(entry));
+    }
+    return sample;
+}
+
+static bool validate_recovery_sample(const vector<RecoverySampleVertex> &sample)
+{
+    uint64_t checked_edges = 0;
+    uint64_t mismatched_vertices = 0;
+    uint64_t missing_vertices = 0;
+    uint64_t degree_mismatches = 0;
+    uint64_t edge_mismatches = 0;
+    int printed = 0;
+
+    for (const RecoverySampleVertex &expected : sample) {
+        checked_edges += expected.neighbors.size();
+        if (expected.vid < 0 ||
+            expected.vid >= static_cast<int32_t>(global_vectex_vec.size()) ||
+            global_vectex_vec[expected.vid] == nullptr) {
+            missing_vertices++;
+            mismatched_vertices++;
+            continue;
+        }
+
+        vector<int32_t> actual;
+        collect_vertex_neighbors_for_debug(global_vectex_vec[expected.vid], actual);
+        bool ok = (actual == expected.neighbors);
+        if (!ok) {
+            mismatched_vertices++;
+            if (actual.size() != expected.neighbors.size()) {
+                degree_mismatches++;
+            }
+            vector<int32_t> expected_minus_actual;
+            vector<int32_t> actual_minus_expected;
+            set_difference(expected.neighbors.begin(), expected.neighbors.end(),
+                           actual.begin(), actual.end(),
+                           back_inserter(expected_minus_actual));
+            set_difference(actual.begin(), actual.end(),
+                           expected.neighbors.begin(), expected.neighbors.end(),
+                           back_inserter(actual_minus_expected));
+            edge_mismatches += expected_minus_actual.size() + actual_minus_expected.size();
+            if (printed < 5) {
+                cout << "Recovery sample mismatch vid=" << expected.vid
+                     << " expected_degree=" << expected.neighbors.size()
+                     << " actual_degree=" << actual.size()
+                     << " missing_edges=" << expected_minus_actual.size()
+                     << " extra_edges=" << actual_minus_expected.size()
+                     << endl;
+                printed++;
+            }
+        }
+    }
+
+    cout << "Recovery sample validation: checked_vertices=" << sample.size()
+         << " checked_edges=" << checked_edges
+         << " mismatched_vertices=" << mismatched_vertices
+         << " missing_vertices=" << missing_vertices
+         << " degree_mismatches=" << degree_mismatches
+         << " edge_mismatches=" << edge_mismatches
+         << " result=" << (mismatched_vertices == 0 ? "PASS" : "FAIL")
+         << endl;
+    return mismatched_vertices == 0;
+}
+
+static void clear_dram_graph_metadata_for_recovery(void)
+{
+    for (Vertex *v : global_vectex_vec) {
+        if (v == nullptr) {
+            continue;
+        }
+        for (pm_blk &blk : v->blk_list) {
+            delete[] blk.buf;
+            blk.buf = nullptr;
+        }
+        free(v->pma);
+        v->pma = nullptr;
+        delete v;
+    }
+    global_vectex_vec.clear();
+    global_edge_vec.clear();
+    global_edge_num = 0;
+    global_max_vid = 0;
+    global_cache_blk = 0;
+    global_pending_edge_count = 0;
+    global_committed_op_id = 0;
+    global_last_applied_op_id = 0;
+    global_edge_log_replay_active = false;
+
+    for (ZoneStatus *zone : global_zone_vec) {
+        if (zone == nullptr) {
+            continue;
+        }
+        zone->val_blocks = 0;
+        for (blk_info &info : zone->blk_info_vec) {
+            info = blk_info();
+        }
+    }
+}
+
 void recover_graph_from_zns_records(void)
 {
     if (!global_zns_record_enabled) {
@@ -2869,6 +3892,7 @@ void recover_graph_from_zns_records(void)
     unordered_map<uint64_t, RecoveredEpochStats> observed_epoch_stats;
     unordered_set<uint64_t> valid_epochs;
     unordered_map<uint64_t, RecoveredRecord> latest_records;
+    unordered_set<uint64_t> recovered_block_keys;
     vector<EdgeLogRecord> redo_records;
     int32_t max_vid = -1;
     uint64_t max_seq = 0;
@@ -2881,8 +3905,10 @@ void recover_graph_from_zns_records(void)
     uint64_t data_records_valid = 0;
     uint64_t data_records_committed_epoch = 0;
     uint64_t redo_records_valid = 0;
+    bool redo_file_used = false;
     uint64_t rebuilt_vertices = 0;
     uint64_t rebuilt_blocks = 0;
+    uint64_t missing_blocks_materialized = 0;
     uint64_t rebuilt_edges = 0;
     double start_t = get_current_time();
 
@@ -2894,7 +3920,9 @@ void recover_graph_from_zns_records(void)
     unsigned long long meta_wp =
         static_cast<unsigned long long>(global_meta_zone) *
         static_cast<unsigned long long>(zns.zone_size);
-    for (int32_t blkidx = 0; blkidx < zns.nr_blocks_perzone; blkidx++) {
+    unsigned long long meta_scan_limit =
+        global_meta_wp >= meta_wp ? global_meta_wp : (meta_wp + zns.zone_size);
+    while (meta_wp < meta_scan_limit) {
         meta_slots_scanned++;
         ZNSBlockHeader header;
         if (readZNSRecordChecked(zns.dev_fd, header, nullptr, 0, meta_wp) &&
@@ -2917,7 +3945,8 @@ void recover_graph_from_zns_records(void)
             continue;
         }
         unsigned long long wp = static_cast<unsigned long long>(zidx) * zns.zone_size;
-        for (int32_t blkidx = 0; blkidx < zns.nr_blocks_perzone; blkidx++) {
+        unsigned long long scan_limit = recovery_zone_scan_limit(zidx);
+        while (wp < scan_limit) {
             data_slots_scanned++;
             ZNSBlockHeader header;
             int32_t payload[PM_BLK_SIZE];
@@ -2960,21 +3989,30 @@ void recover_graph_from_zns_records(void)
         }
     }
 
-    if (global_redo_zone >= 0) {
+    redo_file_used = read_redo_log_file_records(redo_records,
+                                                redo_records_valid,
+                                                max_op_id,
+                                                max_vid);
+
+    if (!redo_file_used && global_redo_zone >= 0) {
         unsigned long long redo_wp =
             static_cast<unsigned long long>(global_redo_zone) *
             static_cast<unsigned long long>(zns.zone_size);
-        for (int32_t blkidx = 0; blkidx < zns.nr_blocks_perzone; blkidx++) {
+        unsigned long long redo_scan_limit =
+            global_redo_wp >= redo_wp ? global_redo_wp : (redo_wp + zns.zone_size);
+        while (redo_wp < redo_scan_limit) {
             redo_slots_scanned++;
-            EdgeLogRecord record;
-            if (!readZNSRedoLogChecked(zns.dev_fd, record, redo_wp)) {
+            vector<EdgeLogRecord> page_records;
+            if (!readZNSRedoLogPageChecked(zns.dev_fd, page_records, redo_wp)) {
                 redo_wp += zns_alloc_unit_size();
                 continue;
             }
-            redo_records_valid++;
-            redo_records.push_back(record);
-            max_op_id = max(max_op_id, record.op_id);
-            max_vid = max(max_vid, max(record.src, record.dst));
+            redo_records_valid += page_records.size();
+            for (const EdgeLogRecord &record : page_records) {
+                redo_records.push_back(record);
+                max_op_id = max(max_op_id, record.op_id);
+                max_vid = max(max_vid, max(record.src, record.dst));
+            }
             global_redo_wp = redo_wp + zns_alloc_unit_size();
             redo_wp += zns_alloc_unit_size();
         }
@@ -2989,7 +4027,8 @@ void recover_graph_from_zns_records(void)
             continue;
         }
         unsigned long long wp = static_cast<unsigned long long>(zidx) * zns.zone_size;
-        for (int32_t blkidx = 0; blkidx < zns.nr_blocks_perzone; blkidx++) {
+        unsigned long long scan_limit = recovery_zone_scan_limit(zidx);
+        while (wp < scan_limit) {
             ZNSBlockHeader header;
             int32_t payload[PM_BLK_SIZE];
             if (!readZNSRecordChecked(zns.dev_fd, header, payload, PM_BLK_SIZE, wp) ||
@@ -2999,8 +4038,7 @@ void recover_graph_from_zns_records(void)
                 continue;
             }
 
-            uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(header.src_vid)) << 32) |
-                           static_cast<uint32_t>(header.pma_blk_idx);
+            uint64_t key = recovered_record_key(header.src_vid, header.pma_blk_idx);
             auto it = latest_records.find(key);
             if (it == latest_records.end() ||
                 header.epoch > it->second.header.epoch ||
@@ -3042,6 +4080,7 @@ void recover_graph_from_zns_records(void)
         }
         v->blk_list[blk_idx].buf = nullptr;
         v->blk_list[blk_idx].global_wp = record.wp;
+        recovered_block_keys.insert(recovered_record_key(vid, blk_idx));
         ZNSBlockHeader checked_header;
         int32_t payload[PM_BLK_SIZE];
         if (readZNSRecordChecked(zns.dev_fd, checked_header, payload, PM_BLK_SIZE, record.wp) &&
@@ -3053,10 +4092,21 @@ void recover_graph_from_zns_records(void)
         v->degree += record.header.valid_count;
         rebuilt_edges += record.header.valid_count;
         v->pma->ele_num = max(v->pma->ele_num, static_cast<int32_t>(record.header.pma_ele));
-        v->pma->arr_cap = max(v->pma->arr_cap, static_cast<int32_t>(record.header.pma_cap));
+        v->pma->arr_cap = max(v->pma->arr_cap,
+                              max(static_cast<int32_t>(record.header.pma_cap),
+                                  (blk_idx + 1) * PM_BLK_SIZE));
         mark_zone(vid, blk_idx, record.wp);
         rebuilt_blocks++;
     }
+
+    for (Vertex *v : global_vectex_vec) {
+        refresh_recovered_pma_shape(v);
+        if (v != nullptr && v->pma != nullptr) {
+            ensure_pma_blocks_for_capacity(v, v->pma);
+        }
+    }
+    missing_blocks_materialized =
+        materialize_missing_recovered_blocks(recovered_block_keys);
 
     // A COMMIT high-water mark is only sufficient when the checkpoint also
     // covers cache-only vertices. Replaying the whole idempotent edge log is
@@ -3081,16 +4131,46 @@ void recover_graph_from_zns_records(void)
          << " data_records_committed_epoch=" << data_records_committed_epoch
          << " latest_records=" << latest_records.size()
          << " redo_slots_scanned=" << redo_slots_scanned
+         << " redo_file_used=" << (redo_file_used ? 1 : 0)
          << " redo_records_valid=" << redo_records_valid
          << " redo_records_replayed=" << redo_records_replayed
          << " rebuilt_vertices=" << rebuilt_vertices
          << " rebuilt_blocks=" << rebuilt_blocks
+         << " missing_blocks_materialized=" << missing_blocks_materialized
          << " rebuilt_edges_before_redo=" << rebuilt_edges
          << " committed_op_id=" << global_committed_op_id
          << " max_seq=" << max_seq
          << " max_epoch=" << max_epoch
          << " max_op_id=" << max_op_id
          << " recovery_time_sec=" << (end_t - start_t)
+         << endl;
+}
+
+void run_recovery_experiment_from_zns(void)
+{
+    if (!global_zns_record_enabled) {
+        std::cerr << "Recovery experiment requires ZNS record mode." << std::endl;
+        exit(EXIT_FAILURE);
+    }
+
+    flushZNSRedoLog();
+    vector<RecoverySampleVertex> validation_sample =
+        build_recovery_validation_sample(128);
+    double start_t = get_current_time();
+    clear_dram_graph_metadata_for_recovery();
+    double after_clear_t = get_current_time();
+    recover_graph_from_zns_records();
+    bool validation_ok = validate_recovery_sample(validation_sample);
+    double end_t = get_current_time();
+    cout << "Recovery experiment time: total=" << (end_t - start_t)
+         << " clear_dram=" << (after_clear_t - start_t)
+         << " zns_and_redo=" << (end_t - after_clear_t)
+         << " graph_maintenance_total=" << last_graph_maintenance_total_time
+         << " graph_maintenance_compute=" << last_graph_maintenance_compute_time
+         << " recovery_vs_load="
+         << (last_graph_maintenance_total_time > 0.0 ?
+             (end_t - after_clear_t) / last_graph_maintenance_total_time : 0.0)
+         << " validation=" << (validation_ok ? "PASS" : "FAIL")
          << endl;
 }
 

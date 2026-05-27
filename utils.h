@@ -18,10 +18,13 @@ void writeZNSRecord(int fd, int32_t src_vid, int32_t pma_blk_idx, PMA *pma,
 void beginZNSEpoch(void);
 void commitZNSEpoch(void);
 uint64_t appendZNSRedoLog(uint32_t op_type, int32_t src, int32_t dst);
+void flushZNSRedoLog(void);
+void resetRedoLogFile(void);
+void closeRedoLogFile(void);
 bool readZNSRecordHeader(int fd, ZNSBlockHeader &header, unsigned long long wp);
 bool readZNSRecordChecked(int fd, ZNSBlockHeader &header, int32_t* array,
                           size_t size, unsigned long long wp);
-bool readZNSRedoLogChecked(int fd, EdgeLogRecord &record, unsigned long long wp);
+bool readZNSRedoLogPageChecked(int fd, vector<EdgeLogRecord> &records, unsigned long long wp);
 void readZNSRecordPayload(int fd, int32_t* &array, size_t size, unsigned long long wp);
 void writeGraphBlockToZone(Vertex *v, int32_t blk_idx, unsigned long long wp);
 void mark_zone(int32_t vid, int32_t blk_idx, unsigned long long wp);
@@ -32,10 +35,11 @@ void reset_zns_write_pointers(void);
 struct zns
 {
     /* 设备信息 */
-    const char			*path; 
+	const char			*path; 
 	int			block_size;
 	int			zone_size;
 	int			dev_fd;
+	int			direct_fd;
 	struct zbd_info		info;  // libzbd 返回的设备信息
 	unsigned int		nr_zones;
 	unsigned int		nr_conv_zones;
@@ -72,6 +76,10 @@ static void zns_close(void)
 
 	zbd_close(zns.dev_fd);
 	zns.dev_fd = -1;
+	if (zns.direct_fd >= 0) {
+		close(zns.direct_fd);
+		zns.direct_fd = -1;
+	}
 
 	free(zns.zones);
 }
@@ -87,6 +95,12 @@ int zns_open(void) {
 	zns.dev_fd = zbd_open(zns.path, O_RDWR, &zns.info);
 	if (zns.dev_fd < 0)
 		return -1;
+	zns.direct_fd = open(zns.path, O_RDWR | O_DIRECT);
+	if (zns.direct_fd < 0) {
+		perror("Failed to open ZNS direct write fd");
+		zns_close();
+		return -1;
+	}
 
 	// if (zns.block_size > 1 &&
 	//     zns.info.zone_size % zns.block_size) {
@@ -244,28 +258,151 @@ static void checkedZoneWrite(int fd, const void *data, size_t bytes,
 		exit(EXIT_FAILURE);
 	}
 
-	vector<char> write_buf(zns_alloc_unit_size(), 0);
-	memcpy(write_buf.data(), data, bytes);
+	size_t write_size = zns_alloc_unit_size();
+	size_t alignment = zns.info.lblock_size == 0 ?
+		static_cast<size_t>(4096) :
+		static_cast<size_t>(zns.info.lblock_size);
+	if (alignment < sizeof(void *)) {
+		alignment = sizeof(void *);
+	}
+	void *aligned_buf = nullptr;
+	if (posix_memalign(&aligned_buf, alignment, write_size) != 0) {
+		std::cerr << tag << " failed to allocate aligned write buffer." << std::endl;
+		exit(EXIT_FAILURE);
+	}
+	memset(aligned_buf, 0, write_size);
+	memcpy(aligned_buf, data, bytes);
 
 	lock_guard<std::mutex> lock(global_zns_device_write_mutex);
 	if (wp != global_zone_write_wp[zone_idx]) {
+		free(aligned_buf);
 		std::cerr << tag << " out-of-order ZNS write: zone=" << zone_idx
 		          << " expected_wp=" << global_zone_write_wp[zone_idx]
 		          << " actual_wp=" << wp << std::endl;
 		exit(EXIT_FAILURE);
 	}
 	if (wp + zns_alloc_unit_size() > global_zone_write_limit[zone_idx]) {
+		free(aligned_buf);
 		std::cerr << tag << " write exceeds zone capacity: zone=" << zone_idx
 		          << " wp=" << wp
 		          << " limit=" << global_zone_write_limit[zone_idx] << std::endl;
 		exit(EXIT_FAILURE);
 	}
-	if (pwrite(fd, write_buf.data(), zns_alloc_unit_size(), wp) !=
-	    static_cast<ssize_t>(zns_alloc_unit_size())) {
+	int write_fd = zns.direct_fd >= 0 ? zns.direct_fd : fd;
+	if (pwrite(write_fd, aligned_buf, write_size, wp) !=
+	    static_cast<ssize_t>(write_size)) {
+		struct zbd_zone failed_zone;
+		memset(&failed_zone, 0, sizeof(failed_zone));
+		unsigned int failed_zone_count = 1;
+		int report_ret = zbd_report_zones(fd, wp, zns.zone_size,
+		                                  ZBD_RO_ALL, &failed_zone,
+		                                  &failed_zone_count);
+		if (report_ret == 0 && failed_zone_count > 0) {
+			std::cerr << tag << " failed zone=" << zone_idx
+			          << " app_expected_wp=" << global_zone_write_wp[zone_idx]
+			          << " actual_wp=" << wp
+			          << " device_wp=" << failed_zone.wp
+			          << " zone_start=" << failed_zone.start
+			          << " zone_cond=" << static_cast<int>(failed_zone.cond)
+			          << " write_size=" << zns_alloc_unit_size() << std::endl;
+		} else {
+			std::cerr << tag << " failed zone=" << zone_idx
+			          << " app_expected_wp=" << global_zone_write_wp[zone_idx]
+			          << " actual_wp=" << wp
+			          << " write_size=" << zns_alloc_unit_size()
+			          << " zbd_report_zones_ret=" << report_ret << std::endl;
+		}
+		free(aligned_buf);
 		perror(tag);
 		exit(EXIT_FAILURE);
 	}
+	free(aligned_buf);
 	global_zone_write_wp[zone_idx] += zns_alloc_unit_size();
+}
+
+static void checkedZoneWriteBatch(int fd, const void *data, size_t bytes,
+                                  unsigned long long wp, const char *tag)
+{
+	if (fd == -1) {
+		perror("ZNS device is not open");
+		exit(EXIT_FAILURE);
+	}
+	if (bytes == 0) {
+		return;
+	}
+	if ((bytes % zns_alloc_unit_size()) != 0) {
+		std::cerr << tag << " batch size " << bytes
+		          << " is not a multiple of allocation unit "
+		          << zns_alloc_unit_size() << std::endl;
+		exit(EXIT_FAILURE);
+	}
+	if ((wp % zns_alloc_unit_size()) != 0) {
+		std::cerr << tag << " unaligned wp=" << wp
+		          << " unit=" << zns_alloc_unit_size() << std::endl;
+		exit(EXIT_FAILURE);
+	}
+
+	int32_t zone_idx = zns_zone_idx_from_wp(wp);
+	if (zone_idx < 0 || zone_idx >= static_cast<int32_t>(global_zone_write_wp.size())) {
+		std::cerr << tag << " invalid zone for wp=" << wp << std::endl;
+		exit(EXIT_FAILURE);
+	}
+
+	lock_guard<std::mutex> lock(global_zns_device_write_mutex);
+	if (wp != global_zone_write_wp[zone_idx]) {
+		std::cerr << tag << " out-of-order ZNS batch write: zone=" << zone_idx
+		          << " expected_wp=" << global_zone_write_wp[zone_idx]
+		          << " actual_wp=" << wp << std::endl;
+		exit(EXIT_FAILURE);
+	}
+	if (wp + bytes > global_zone_write_limit[zone_idx]) {
+		std::cerr << tag << " batch write exceeds zone capacity: zone=" << zone_idx
+		          << " wp=" << wp
+		          << " bytes=" << bytes
+		          << " limit=" << global_zone_write_limit[zone_idx] << std::endl;
+		exit(EXIT_FAILURE);
+	}
+	int write_fd = zns.direct_fd >= 0 ? zns.direct_fd : fd;
+	size_t alignment = zns.info.lblock_size == 0 ?
+		static_cast<size_t>(4096) :
+		static_cast<size_t>(zns.info.lblock_size);
+	if (alignment < sizeof(void *)) {
+		alignment = sizeof(void *);
+	}
+	void *aligned_buf = nullptr;
+	if (posix_memalign(&aligned_buf, alignment, bytes) != 0) {
+		std::cerr << tag << " failed to allocate aligned batch write buffer." << std::endl;
+		exit(EXIT_FAILURE);
+	}
+	memcpy(aligned_buf, data, bytes);
+	if (pwrite(write_fd, aligned_buf, bytes, wp) != static_cast<ssize_t>(bytes)) {
+		struct zbd_zone failed_zone;
+		memset(&failed_zone, 0, sizeof(failed_zone));
+		unsigned int failed_zone_count = 1;
+		int report_ret = zbd_report_zones(fd, wp, zns.zone_size,
+		                                  ZBD_RO_ALL, &failed_zone,
+		                                  &failed_zone_count);
+		if (report_ret == 0 && failed_zone_count > 0) {
+			std::cerr << tag << " failed zone=" << zone_idx
+			          << " app_expected_wp=" << global_zone_write_wp[zone_idx]
+			          << " actual_wp=" << wp
+			          << " device_wp=" << failed_zone.wp
+			          << " zone_start=" << failed_zone.start
+			          << " zone_cond=" << static_cast<int>(failed_zone.cond)
+			          << " write_size=" << bytes << std::endl;
+		} else {
+			std::cerr << tag << " failed zone=" << zone_idx
+			          << " app_expected_wp=" << global_zone_write_wp[zone_idx]
+			          << " actual_wp=" << wp
+			          << " write_size=" << bytes
+			          << " zbd_report_zones_ret=" << report_ret << std::endl;
+		}
+		free(aligned_buf);
+		perror(tag);
+		exit(EXIT_FAILURE);
+	}
+	free(aligned_buf);
+	global_zone_write_wp[zone_idx] += bytes;
 }
 
 void report_device_info(struct zbd_info info) {
@@ -304,6 +441,12 @@ bool garbage_collection() {
 		4. reset 原 zone，并把它设为新的空白 zone
 	*/
 	lock_guard<std::mutex> gc_lock(global_gc_mutex);
+	double start_t = get_current_time();
+	auto finish_gc = [&](bool result) {
+		total_gc_time += (get_current_time() - start_t);
+		total_gc_count++;
+		return result;
+	};
 	cout << "garbage collection begin!" << endl;
 	unsigned long long wp = 0;
 	unsigned long long rp = 0;
@@ -341,7 +484,7 @@ bool garbage_collection() {
 					cout << "GC abort: busy vertex " << vid << endl;
 					commitZNSEpoch();
 					delete[] array;
-					return false;
+					return finish_gc(false);
 				}
 				blk_info cur_info = global_zone_vec[zidx]->blk_info_vec[blkidx];
 				if (!cur_info.status || cur_info.src != vid ||
@@ -379,108 +522,13 @@ bool garbage_collection() {
 		global_empty_zone = zidx;
 	}
 	delete[] array;
-	return true;
+	return finish_gc(true);
 }
 
 bool garbage_collection_new() {
-		/*
-			并行模式的垃圾回收版本。
-			回收后将空闲块重新放回对应 zone 的分配队列中。
-		*/
-	std::cerr << "garbage_collection_new is disabled: it swaps the empty zone "
-	          << "with data zones and breaks per-zone write queues." << std::endl;
+	// Parallel-mode GC is not yet implemented; baseline GC does not support per-zone queues.
+	std::cerr << "garbage_collection_new is not implemented." << std::endl;
 	return false;
-	lock_guard<std::mutex> gc_lock(global_gc_mutex);
-	double start_t = get_current_time();
-	cout << "garbage collection begin! global_empty_zone:" << global_empty_zone << endl;
-	unsigned long long wp = 0;
-	unsigned long long rp = 0;
-	int32_t pre_empty_zone = global_empty_zone;
-
-	// 清空现有 zone 队列
-	for (int i = 0; i < global_blk_queues.size(); i++) {
-		while (!global_blk_queues[i]->memoryWPs.empty()) {
-			global_blk_queues[i]->memoryWPs.pop();
-		}
-	}
-
-	int32_t* array = new int32_t[PM_BLK_SIZE];
-	for (int zidx = 0; zidx < zns.nr_zones; zidx++) {
-		if (zidx == global_empty_zone || zidx == pre_empty_zone ||
-		    zidx == global_meta_zone || zidx == global_redo_zone) {
-			continue;
-		}
-		// cout << "global empty zone: " << global_empty_zone << " zns.zone_size: " << zns.zone_size << endl;
-		wp = (unsigned long long)global_empty_zone * (unsigned long long)zns.zone_size;  // 空白 zone 起始位置
-		rp = (unsigned long long)zns.zone_size * (unsigned long long)zidx;
-
-		int tmp_used_blk = 0;
-		beginZNSEpoch();
-		// 将有效块搬迁到空白 zone 中
-		for (int blkidx = 0; blkidx < zns.nr_blocks_perzone; blkidx++) {
-			if (test_block(zidx, blkidx)) { // 当前为有效块
-				// cout << "Collect zone: " << zidx << " block: " << blkidx << endl;
-				// rp = zns.zone_size * zidx + ZONE_BLK_SIZE * blkidx;
-				// cout << "wp: " << wp << endl;
-				readBlockFromZone(zns.dev_fd, array, PM_BLK_SIZE, rp);
-
-				// for (int i=0; i < PM_BLK_SIZE; i++) {
-				// 	cout << array[i] << ",";
-				// }
-				// cout << endl;
-
-				// 更新顶点记录的物理地址
-				int32_t vid = global_zone_vec[zidx]->blk_info_vec[blkidx].src;
-				int32_t ori_blk_idx = global_zone_vec[zidx]->blk_info_vec[blkidx].blkIndex;
-				Vertex *v = global_vectex_vec[vid];
-				unique_lock<std::shared_timed_mutex> vertex_lock(v->mutex, defer_lock);
-				if (!vertex_lock.try_lock()) {
-					cout << "GC abort: busy vertex " << vid << endl;
-					commitZNSEpoch();
-					delete[] array;
-					return false;
-				}
-				blk_info cur_info = global_zone_vec[zidx]->blk_info_vec[blkidx];
-				if (!cur_info.status || cur_info.src != vid ||
-				    cur_info.blkIndex != ori_blk_idx) {
-					continue;
-				}
-				if (global_zns_record_enabled) {
-					writeZNSRecord(zns.dev_fd, vid, ori_blk_idx, v->pma, array, PM_BLK_SIZE, wp);
-				} else {
-					writeBlockToZone(zns.dev_fd, array, PM_BLK_SIZE, wp);
-				}
-				refresh_pm_blk_meta(v->blk_list[ori_blk_idx], array);
-				v->blk_list[ori_blk_idx].global_wp = wp; // 新块已写入设备，因此对应 buf 应保持为空
-				v->blk_list[ori_blk_idx].buf = nullptr;
-				global_zone_vec[zidx]->blk_info_vec[blkidx].status = false; // 原块失效
-				// 标记新位置的映射关系
-				mark_zone(vid, ori_blk_idx, wp);
-				wp += zns_alloc_unit_size(); 
-				tmp_used_blk++;
-			}
-			rp += zns_alloc_unit_size();
-		}
-		commitZNSEpoch();
-		// 将空白 zone 剩余块重新加入对应分配队列
-		for (int i = tmp_used_blk; i < zns.nr_blocks_perzone; i++) {
-			global_blk_queues[zidx]->memoryWPs.push(wp);
-			// pm_blk blk;
-			// blk.global_wp = wp;
-			// blk.buf = nullptr;
-			// graph_blk_que.push(blk);
-			wp += zns_alloc_unit_size(); 
-		}
-		// reset 原 zone
-		zbd_reset_zones(zns.dev_fd, (zidx * zns.zone_size), zns.zone_size);
-		reset_zns_write_pointer_for_zone(zidx);
-		global_empty_zone = zidx;
-	}
-	delete[] array;
-
-	double end_t = get_current_time();
-    cout << "Garbage collection time: " << end_t - start_t << endl;
-	return true;
 }
 
 
@@ -528,6 +576,8 @@ void generate_block_opt(void)
 	hot_zone_ids.clear();
 	cold_zone_ids.clear();
 	hub_zone_ids.clear();
+	global_atz_zone_types.assign(zns.nr_zones, ATZ_ZONE_FREE);
+	atz_temperature_initialized = false;
 
 	unsigned long long wp = 0;
     for (int zoneidx = 0; zoneidx < global_num_queues; zoneidx++) {
@@ -593,10 +643,19 @@ unsigned long long requestMemoryBlocks(int thread_id)
 	// 检查是否成功获取可写块
 	if (blockAcquired) {
 		return wp;
-	} else {
-		std::cout << "All memory blocks are in use. Initiating garbage collection." << std::endl;
-		exit(1);
 	}
+
+	// All zones exhausted — trigger GC and retry once
+	std::cout << "All memory blocks are in use. Initiating garbage collection." << std::endl;
+	garbage_collection();
+	for (int i = 0; i < global_num_queues; i++) {
+		if (global_blk_queues[i]->getNextBlock(wp)) {
+			return wp;
+		}
+	}
+
+	std::cerr << "requestMemoryBlocks: no block available even after GC." << std::endl;
+	exit(EXIT_FAILURE);
 }
 
 void writeBlockToZone(int fd, int32_t* array, size_t size, unsigned long long wp) {
@@ -723,9 +782,130 @@ static uint32_t zns_redo_checksum(const EdgeLogRecord &record)
     return hash;
 }
 
+static uint32_t zns_redo_page_checksum(const EdgeLogPageHeader &header,
+                                       const EdgeLogEntry *entries)
+{
+    uint32_t hash = 2166136261u;
+    EdgeLogPageHeader tmp = header;
+    tmp.checksum = 0;
+    const unsigned char *header_bytes =
+        reinterpret_cast<const unsigned char *>(&tmp);
+    for (size_t i = 0; i < sizeof(EdgeLogPageHeader); i++) {
+        hash ^= header_bytes[i];
+        hash *= 16777619u;
+    }
+    if (entries != nullptr && header.record_count > 0) {
+        const unsigned char *entry_bytes =
+            reinterpret_cast<const unsigned char *>(entries);
+        size_t entry_bytes_len =
+            static_cast<size_t>(header.record_count) * sizeof(EdgeLogEntry);
+        for (size_t i = 0; i < entry_bytes_len; i++) {
+            hash ^= entry_bytes[i];
+            hash *= 16777619u;
+        }
+    }
+    return hash;
+}
+
+static void flushZNSRedoLogLocked(void)
+{
+    if (!global_zns_record_enabled || !global_redo_log_enabled ||
+        global_redo_page_count == 0) {
+        return;
+    }
+    if (zns.dev_fd == -1) {
+        perror("Failed to open file for redo log writing");
+        exit(EXIT_FAILURE);
+    }
+    if (global_redo_zone < 0) {
+        std::cerr << "ZNS redo log requires a dedicated redo zone." << std::endl;
+        exit(EXIT_FAILURE);
+    }
+    if (global_redo_wp + zns_alloc_unit_size() >
+        global_zone_write_limit[global_redo_zone]) {
+        std::cerr << "No free space left in ZNS redo log zone." << std::endl;
+        exit(EXIT_FAILURE);
+    }
+
+    char raw[ZNS_RECORD_SIZE];
+    memset(raw, 0, sizeof(raw));
+
+    EdgeLogPageHeader header;
+    memset(&header, 0, sizeof(header));
+    header.magic = ZNS_REDO_PAGE_MAGIC;
+    header.version = ZNS_BLOCK_VERSION;
+    header.record_count = global_redo_page_count;
+    header.payload_bytes = global_redo_page_count * sizeof(EdgeLogEntry);
+    header.first_op_id = global_redo_page_entries[0].op_id;
+    header.last_op_id = global_redo_page_entries[global_redo_page_count - 1].op_id;
+    header.tail_magic = ZNS_REDO_PAGE_TAIL_MAGIC;
+    header.checksum = zns_redo_page_checksum(header, global_redo_page_entries);
+
+    memcpy(raw, &header, sizeof(header));
+    memcpy(raw + sizeof(EdgeLogPageHeader),
+           global_redo_page_entries,
+           header.payload_bytes);
+
+    unsigned long long wp = global_redo_wp;
+    global_redo_wp += zns_alloc_unit_size();
+    checkedZoneWrite(zns.dev_fd, raw, ZNS_RECORD_SIZE, wp,
+                     "Failed to write ZNS redo log page");
+    global_redo_page_count = 0;
+}
+
+static void ensureRedoLogFileOpenLocked(const char *mode)
+{
+    if (!global_redo_file_enabled || !global_redo_log_enabled) {
+        return;
+    }
+    if (global_redo_log_file != nullptr) {
+        return;
+    }
+    global_redo_log_file = fopen(global_redo_log_file_path.c_str(), mode);
+    if (global_redo_log_file == nullptr) {
+        perror("Failed to open redo log file");
+        exit(EXIT_FAILURE);
+    }
+    static char redo_file_buffer[4 * 1024 * 1024];
+    setvbuf(global_redo_log_file, redo_file_buffer, _IOFBF, sizeof(redo_file_buffer));
+}
+
+void resetRedoLogFile(void)
+{
+    if (!global_redo_file_enabled || !global_redo_log_enabled) {
+        return;
+    }
+    lock_guard<std::mutex> lock(global_redo_log_mutex);
+    if (global_redo_log_file != nullptr) {
+        fclose(global_redo_log_file);
+        global_redo_log_file = nullptr;
+    }
+    ensureRedoLogFileOpenLocked("wb");
+}
+
+void closeRedoLogFile(void)
+{
+    lock_guard<std::mutex> lock(global_redo_log_mutex);
+    if (global_redo_log_file != nullptr) {
+        fflush(global_redo_log_file);
+        fclose(global_redo_log_file);
+        global_redo_log_file = nullptr;
+    }
+}
+
+void flushZNSRedoLog(void)
+{
+    lock_guard<std::mutex> lock(global_redo_log_mutex);
+    flushZNSRedoLogLocked();
+    if (global_redo_log_file != nullptr) {
+        fflush(global_redo_log_file);
+    }
+}
+
 uint64_t appendZNSRedoLog(uint32_t op_type, int32_t src, int32_t dst)
 {
-    if (!global_zns_record_enabled || global_edge_log_replay_active) {
+    if (!global_zns_record_enabled || !global_redo_log_enabled ||
+        global_edge_log_replay_active) {
         return 0;
     }
     if (zns.dev_fd == -1) {
@@ -737,53 +917,49 @@ uint64_t appendZNSRedoLog(uint32_t op_type, int32_t src, int32_t dst)
         exit(EXIT_FAILURE);
     }
 
-    EdgeLogRecord record;
-    unsigned long long wp = 0;
+    uint64_t op_id = 0;
     {
         lock_guard<std::mutex> lock(global_redo_log_mutex);
-        if (global_redo_wp + zns_alloc_unit_size() >
-            global_zone_write_limit[global_redo_zone]) {
-            std::cerr << "No free space left in ZNS redo log zone." << std::endl;
+        if (global_redo_page_count >= ZNS_REDO_ENTRIES_PER_PAGE) {
+            flushZNSRedoLogLocked();
+        }
+
+        EdgeLogEntry &entry = global_redo_page_entries[global_redo_page_count++];
+        memset(&entry, 0, sizeof(entry));
+        entry.op_id = global_next_op_id++;
+        entry.src = src;
+        entry.dst = dst;
+        entry.op_type = op_type;
+        op_id = entry.op_id;
+        global_last_applied_op_id = op_id;
+
+        ensureRedoLogFileOpenLocked("ab");
+        if (global_redo_log_file != nullptr &&
+            fwrite(&entry, sizeof(entry), 1, global_redo_log_file) != 1) {
+            perror("Failed to write redo log file");
             exit(EXIT_FAILURE);
         }
 
-        memset(&record, 0, sizeof(record));
-        record.magic = ZNS_REDO_MAGIC;
-        record.version = ZNS_BLOCK_VERSION;
-        record.op_type = op_type;
-        record.op_id = global_next_op_id++;
-        record.src = src;
-        record.dst = dst;
-        record.tail_magic = ZNS_REDO_TAIL_MAGIC;
-        record.checksum = zns_redo_checksum(record);
-
-        wp = global_redo_wp;
-        global_redo_wp += zns_alloc_unit_size();
-        global_last_applied_op_id = record.op_id;
-
-        char raw[ZNS_RECORD_SIZE];
-        memset(raw, 0, sizeof(raw));
-        memcpy(raw, &record, sizeof(record));
-        checkedZoneWrite(zns.dev_fd, raw, ZNS_RECORD_SIZE, wp,
-                         "Failed to write ZNS redo log record");
+        if (global_redo_page_count >= ZNS_REDO_ENTRIES_PER_PAGE) {
+            flushZNSRedoLogLocked();
+        }
     }
-    return record.op_id;
+    return op_id;
 }
 
-void writeZNSRecord(int fd, int32_t src_vid, int32_t pma_blk_idx, PMA *pma,
-                    int32_t *array, size_t size, unsigned long long wp)
+static void buildZNSRecord(char record[ZNS_RECORD_SIZE],
+                           int32_t src_vid,
+                           int32_t pma_blk_idx,
+                           PMA *pma,
+                           int32_t *array,
+                           size_t size)
 {
-    if (fd == -1) {
-        perror("Failed to open file for ZNS record writing");
-        exit(EXIT_FAILURE);
-    }
     if (sizeof(ZNSBlockHeader) + size * sizeof(int32_t) > ZNS_RECORD_SIZE) {
         std::cerr << "ZNS record payload is larger than ZNS_RECORD_SIZE." << std::endl;
         exit(EXIT_FAILURE);
     }
 
-    char record[ZNS_RECORD_SIZE];
-    memset(record, 0, sizeof(record));
+    memset(record, 0, ZNS_RECORD_SIZE);
 
     ZNSBlockHeader header;
     memset(&header, 0, sizeof(header));
@@ -823,9 +999,21 @@ void writeZNSRecord(int fd, int32_t src_vid, int32_t pma_blk_idx, PMA *pma,
 
         memcpy(record, &header, sizeof(header));
         memcpy(record + sizeof(ZNSBlockHeader), array, size * sizeof(int32_t));
-        checkedZoneWrite(fd, record, ZNS_RECORD_SIZE, wp,
-                         "Failed to write ZNS record");
     }
+}
+
+void writeZNSRecord(int fd, int32_t src_vid, int32_t pma_blk_idx, PMA *pma,
+                    int32_t *array, size_t size, unsigned long long wp)
+{
+    if (fd == -1) {
+        perror("Failed to open file for ZNS record writing");
+        exit(EXIT_FAILURE);
+    }
+
+    char record[ZNS_RECORD_SIZE];
+    buildZNSRecord(record, src_vid, pma_blk_idx, pma, array, size);
+    checkedZoneWrite(fd, record, ZNS_RECORD_SIZE, wp,
+                     "Failed to write ZNS record");
 }
 
 void beginZNSEpoch(void)
@@ -849,6 +1037,7 @@ void commitZNSEpoch(void)
     if (!global_zns_record_enabled) {
         return;
     }
+    flushZNSRedoLog();
 
     ZNSBlockHeader header;
     memset(&header, 0, sizeof(header));
@@ -947,26 +1136,71 @@ bool readZNSRecordChecked(int fd, ZNSBlockHeader &header, int32_t* array,
     return false;
 }
 
-bool readZNSRedoLogChecked(int fd, EdgeLogRecord &record, unsigned long long wp)
+bool readZNSRedoLogPageChecked(int fd, vector<EdgeLogRecord> &records, unsigned long long wp)
 {
     if (fd == -1) {
         perror("Failed to open file for redo log reading");
         exit(EXIT_FAILURE);
     }
+    records.clear();
     char raw[ZNS_RECORD_SIZE];
     if (pread(fd, raw, ZNS_RECORD_SIZE, wp) != ZNS_RECORD_SIZE) {
         perror("Failed to read ZNS redo log record");
         exit(EXIT_FAILURE);
     }
-    memcpy(&record, raw, sizeof(EdgeLogRecord));
-    if (record.magic != ZNS_REDO_MAGIC ||
-        record.version != ZNS_BLOCK_VERSION ||
-        record.tail_magic != ZNS_REDO_TAIL_MAGIC ||
-        (record.op_type != EDGE_LOG_INSERT &&
-         record.op_type != EDGE_LOG_DELETE)) {
+
+    EdgeLogPageHeader header;
+    memcpy(&header, raw, sizeof(EdgeLogPageHeader));
+    if (header.magic == ZNS_REDO_PAGE_MAGIC &&
+        header.version == ZNS_BLOCK_VERSION &&
+        header.tail_magic == ZNS_REDO_PAGE_TAIL_MAGIC) {
+        if (header.record_count == 0 ||
+            header.record_count > ZNS_REDO_ENTRIES_PER_PAGE ||
+            header.payload_bytes != header.record_count * sizeof(EdgeLogEntry)) {
+            return false;
+        }
+        const EdgeLogEntry *entries =
+            reinterpret_cast<const EdgeLogEntry *>(raw + sizeof(EdgeLogPageHeader));
+        if (zns_redo_page_checksum(header, entries) != header.checksum) {
+            return false;
+        }
+
+        records.reserve(header.record_count);
+        for (uint32_t i = 0; i < header.record_count; i++) {
+            if (entries[i].op_type != EDGE_LOG_INSERT &&
+                entries[i].op_type != EDGE_LOG_DELETE) {
+                records.clear();
+                return false;
+            }
+            EdgeLogRecord record;
+            memset(&record, 0, sizeof(record));
+            record.magic = ZNS_REDO_MAGIC;
+            record.version = ZNS_BLOCK_VERSION;
+            record.op_type = entries[i].op_type;
+            record.op_id = entries[i].op_id;
+            record.src = entries[i].src;
+            record.dst = entries[i].dst;
+            record.tail_magic = ZNS_REDO_TAIL_MAGIC;
+            record.checksum = zns_redo_checksum(record);
+            records.push_back(record);
+        }
+        return true;
+    }
+
+    EdgeLogRecord legacy_record;
+    memcpy(&legacy_record, raw, sizeof(EdgeLogRecord));
+    if (legacy_record.magic != ZNS_REDO_MAGIC ||
+        legacy_record.version != ZNS_BLOCK_VERSION ||
+        legacy_record.tail_magic != ZNS_REDO_TAIL_MAGIC ||
+        (legacy_record.op_type != EDGE_LOG_INSERT &&
+         legacy_record.op_type != EDGE_LOG_DELETE)) {
         return false;
     }
-    return zns_redo_checksum(record) == record.checksum;
+    if (zns_redo_checksum(legacy_record) != legacy_record.checksum) {
+        return false;
+    }
+    records.push_back(legacy_record);
+    return true;
 }
 
 void readZNSRecordPayload(int fd, int32_t* &array, size_t size, unsigned long long wp)

@@ -39,6 +39,8 @@ using namespace std;
 #define ZNS_RECORD_TAIL_MAGIC 0x504D475A
 #define ZNS_REDO_MAGIC 0x5A475244
 #define ZNS_REDO_TAIL_MAGIC 0x4452475A
+#define ZNS_REDO_PAGE_MAGIC 0x5A475250
+#define ZNS_REDO_PAGE_TAIL_MAGIC 0x5052475A
 
 enum ZNSRecordType : uint32_t {
 	ZNS_RECORD_DATA = 1,
@@ -82,6 +84,27 @@ struct EdgeLogRecord {
 	uint32_t checksum;
 	uint32_t tail_magic;
 };
+
+struct EdgeLogEntry {
+	uint64_t op_id;
+	int32_t src;
+	int32_t dst;
+	uint32_t op_type;
+};
+
+struct EdgeLogPageHeader {
+	uint32_t magic;
+	uint32_t version;
+	uint32_t record_count;
+	uint32_t payload_bytes;
+	uint64_t first_op_id;
+	uint64_t last_op_id;
+	uint32_t checksum;
+	uint32_t tail_magic;
+};
+
+static const uint32_t ZNS_REDO_ENTRIES_PER_PAGE =
+	(ZNS_RECORD_SIZE - sizeof(EdgeLogPageHeader)) / sizeof(EdgeLogEntry);
 
 static inline size_t zns_alloc_unit_size(void);
 
@@ -158,10 +181,18 @@ enum VertexClass {
 	VERTEX_HUB = 2
 };
 
-enum GCMode {
-	GC_GLOBAL = 0,
-	GC_CLASS_AWARE = 1,
-	GC_CLASS_LOCAL = 2
+enum ATZVertexType {
+	ATZ_VERTEX_COLD = 0,
+	ATZ_VERTEX_WARM = 1,
+	ATZ_VERTEX_HOT = 2
+};
+
+enum ATZZoneType {
+	ATZ_ZONE_FREE = 0,
+	ATZ_ZONE_MIXED = 1,
+	ATZ_ZONE_COLD = 2,
+	ATZ_ZONE_WARM = 3,
+	ATZ_ZONE_HOT = 4
 };
 
 class Vertex {
@@ -178,6 +209,9 @@ public:
 		bool recovery_flag; // 恢复过程中避免重复处理
 		int32_t update_count; // 动态更新次数，用于 hot 顶点分类
 		VertexClass vclass; // 可选 vertex-class to zone-class 策略使用
+		double temperature; // ATZ-GC 指数衰减更新热度
+		int32_t recent_updates; // ATZ-GC 最近一个窗口内的更新次数
+		ATZVertexType atz_type; // ATZ-GC hot/warm/cold 分类
 
 		Vertex(int32_t vid){
 			id = vid;
@@ -185,6 +219,9 @@ public:
 			recovery_flag = false;
 			update_count = 0;
 			vclass = VERTEX_COLD;
+			temperature = 0.0;
+			recent_updates = 0;
+			atz_type = ATZ_VERTEX_COLD;
 			fill(cache_buf, cache_buf + CACHE_BLK_SIZE, -1);
 		}
 
@@ -220,6 +257,10 @@ public:
 
 int nr_blocks_perzone = 0;
 bool global_zns_record_enabled = true;
+bool global_redo_log_enabled = false;
+bool global_redo_file_enabled = true;
+string global_redo_log_file_path = "/home/femu/project/zoneGraph/redo.log";
+FILE *global_redo_log_file = nullptr;
 uint64_t global_zns_record_seq = 1;
 uint64_t global_current_epoch = 1;
 bool global_zns_epoch_active = false;
@@ -242,6 +283,8 @@ std::mutex global_zns_device_write_mutex;
 std::mutex global_gc_mutex;
 std::mutex global_pending_merge_mutex;
 std::shared_timed_mutex global_query_update_mutex;
+EdgeLogEntry global_redo_page_entries[ZNS_REDO_ENTRIES_PER_PAGE];
+uint32_t global_redo_page_count = 0;
 
 class MemoryWPQueue {
 public:
@@ -316,9 +359,9 @@ unsigned long long global_blk_wp = 0; // 基线模式下当前分配到的全局
 int32_t global_blk_id = 0;
 // int32_t global_cache_blk = 0;
 atomic<int> global_cache_blk(0);
-int32_t cache_blk_threshold = 10;
+int32_t cache_blk_threshold = 200000;
 atomic<int64_t> global_pending_edge_count(0);
-int64_t pending_merge_threshold = 2;
+int64_t pending_merge_threshold = 4000000;
 bool global_debug_pending_merge = false;
 int32_t global_cache_buf_threshold = CACHE_BLK_SIZE;
 int64_t global_edge_num = 0;
@@ -331,17 +374,50 @@ vector<unsigned long long> global_zone_write_limit;
 int32_t global_empty_zone = 0;
 
 int32_t global_num_queues = 0;
-int64_t global_batch_size = 10000000;  
+int64_t global_batch_size = 1000000;  
 double total_dump_time = 0.0;
+int64_t total_dump_count = 0;
+double total_gc_time = 0.0;
+int64_t total_gc_count = 0;
+int64_t total_gc_moved_blocks = 0;
+double last_graph_maintenance_total_time = 0.0;
+double last_graph_maintenance_compute_time = 0.0;
 bool global_delete_compaction_enabled = false;
 bool global_zone_class_enabled = false;
-GCMode global_gc_mode = GC_GLOBAL;
+bool global_atz_gc_enabled = false;
+bool global_basic_gc_enabled = false;
+bool atz_temperature_initialized = false;
+int32_t global_max_data_zones_override = 0;
+int64_t global_gc_proactive_free_blocks = 0;
 int32_t hot_update_threshold = 8;
 int32_t hub_degree_threshold = 1024;
 int32_t hub_block_threshold = 16;
 vector<int32_t> hot_zone_ids;
 vector<int32_t> cold_zone_ids;
 vector<int32_t> hub_zone_ids;
+vector<ATZZoneType> global_atz_zone_types;
+double atz_temperature_alpha = 0.5;
+double atz_hot_threshold = 8.0;
+double atz_cold_threshold = 2.0;
+double atz_cold_live_beta = 8.0;
+double atz_cold_gc_threshold = 0.90;
+int64_t atz_free_zone_emergency_watermark = 0;
+int64_t atz_hot_zone_gc_count = 0;
+int64_t atz_warm_zone_gc_count = 0;
+int64_t atz_mixed_zone_gc_count = 0;
+int64_t atz_cold_zone_gc_count = 0;
+int64_t atz_emergency_gc_count = 0;
+int64_t atz_migrated_hot_blocks = 0;
+int64_t atz_migrated_warm_blocks = 0;
+int64_t atz_migrated_cold_blocks = 0;
+int64_t atz_cold_zone_skipped_count = 0;
+int64_t atz_cold_zone_protected_count = 0;
+int64_t atz_invalid_blocks_reclaimed = 0;
+int64_t atz_gc_write_bytes = 0;
+int64_t atz_user_write_bytes = 0;
+int64_t atz_hot_block_update_writes = 0;
+int64_t atz_warm_block_update_writes = 0;
+int64_t atz_cold_block_update_writes = 0;
 
 static inline size_t zns_alloc_unit_size(void)
 {
