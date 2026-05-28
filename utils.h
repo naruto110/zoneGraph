@@ -24,6 +24,8 @@ void closeRedoLogFile(void);
 bool readZNSRecordHeader(int fd, ZNSBlockHeader &header, unsigned long long wp);
 bool readZNSRecordChecked(int fd, ZNSBlockHeader &header, int32_t* array,
                           size_t size, unsigned long long wp);
+bool decodeZNSRedoLogPageRaw(const char raw[ZNS_RECORD_SIZE],
+                             vector<EdgeLogRecord> &records);
 bool readZNSRedoLogPageChecked(int fd, vector<EdgeLogRecord> &records, unsigned long long wp);
 void readZNSRecordPayload(int fd, int32_t* &array, size_t size, unsigned long long wp);
 void writeGraphBlockToZone(Vertex *v, int32_t blk_idx, unsigned long long wp);
@@ -807,6 +809,8 @@ static uint32_t zns_redo_page_checksum(const EdgeLogPageHeader &header,
     return hash;
 }
 
+static void ensureRedoLogFileOpenLocked(const char *mode);
+
 static void flushZNSRedoLogLocked(void)
 {
     if (!global_zns_record_enabled || !global_redo_log_enabled ||
@@ -845,6 +849,13 @@ static void flushZNSRedoLogLocked(void)
     memcpy(raw + sizeof(EdgeLogPageHeader),
            global_redo_page_entries,
            header.payload_bytes);
+
+    ensureRedoLogFileOpenLocked("ab");
+    if (global_redo_log_file != nullptr &&
+        fwrite(raw, ZNS_RECORD_SIZE, 1, global_redo_log_file) != 1) {
+        perror("Failed to write redo log file page");
+        exit(EXIT_FAILURE);
+    }
 
     unsigned long long wp = global_redo_wp;
     global_redo_wp += zns_alloc_unit_size();
@@ -932,13 +943,6 @@ uint64_t appendZNSRedoLog(uint32_t op_type, int32_t src, int32_t dst)
         entry.op_type = op_type;
         op_id = entry.op_id;
         global_last_applied_op_id = op_id;
-
-        ensureRedoLogFileOpenLocked("ab");
-        if (global_redo_log_file != nullptr &&
-            fwrite(&entry, sizeof(entry), 1, global_redo_log_file) != 1) {
-            perror("Failed to write redo log file");
-            exit(EXIT_FAILURE);
-        }
 
         if (global_redo_page_count >= ZNS_REDO_ENTRIES_PER_PAGE) {
             flushZNSRedoLogLocked();
@@ -1136,19 +1140,10 @@ bool readZNSRecordChecked(int fd, ZNSBlockHeader &header, int32_t* array,
     return false;
 }
 
-bool readZNSRedoLogPageChecked(int fd, vector<EdgeLogRecord> &records, unsigned long long wp)
+bool decodeZNSRedoLogPageRaw(const char raw[ZNS_RECORD_SIZE],
+                             vector<EdgeLogRecord> &records)
 {
-    if (fd == -1) {
-        perror("Failed to open file for redo log reading");
-        exit(EXIT_FAILURE);
-    }
     records.clear();
-    char raw[ZNS_RECORD_SIZE];
-    if (pread(fd, raw, ZNS_RECORD_SIZE, wp) != ZNS_RECORD_SIZE) {
-        perror("Failed to read ZNS redo log record");
-        exit(EXIT_FAILURE);
-    }
-
     EdgeLogPageHeader header;
     memcpy(&header, raw, sizeof(EdgeLogPageHeader));
     if (header.magic == ZNS_REDO_PAGE_MAGIC &&
@@ -1184,6 +1179,26 @@ bool readZNSRedoLogPageChecked(int fd, vector<EdgeLogRecord> &records, unsigned 
             record.checksum = zns_redo_checksum(record);
             records.push_back(record);
         }
+        return true;
+    }
+
+    return false;
+}
+
+bool readZNSRedoLogPageChecked(int fd, vector<EdgeLogRecord> &records, unsigned long long wp)
+{
+    if (fd == -1) {
+        perror("Failed to open file for redo log reading");
+        exit(EXIT_FAILURE);
+    }
+    records.clear();
+    char raw[ZNS_RECORD_SIZE];
+    if (pread(fd, raw, ZNS_RECORD_SIZE, wp) != ZNS_RECORD_SIZE) {
+        perror("Failed to read ZNS redo log record");
+        exit(EXIT_FAILURE);
+    }
+
+    if (decodeZNSRedoLogPageRaw(raw, records)) {
         return true;
     }
 

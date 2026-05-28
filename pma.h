@@ -3684,6 +3684,51 @@ static bool read_redo_log_file_records(vector<EdgeLogRecord> &records,
         return false;
     }
 
+    input.seekg(0, ios::end);
+    streamoff file_size = input.tellg();
+    input.seekg(0, ios::beg);
+    if (file_size <= 0) {
+        return false;
+    }
+
+    if (file_size % ZNS_RECORD_SIZE == 0) {
+        bool page_file_ok = true;
+        while (input.good() && input.tellg() < file_size) {
+            char raw[ZNS_RECORD_SIZE];
+            input.read(raw, ZNS_RECORD_SIZE);
+            if (input.gcount() != ZNS_RECORD_SIZE) {
+                page_file_ok = false;
+                break;
+            }
+            vector<EdgeLogRecord> page_records;
+            if (!decodeZNSRedoLogPageRaw(raw, page_records)) {
+                page_file_ok = false;
+                break;
+            }
+            for (const EdgeLogRecord &record : page_records) {
+                records.push_back(record);
+                records_valid++;
+                max_op_id = max(max_op_id, record.op_id);
+                max_vid = max(max_vid, max(record.src, record.dst));
+            }
+        }
+        if (page_file_ok) {
+            sort(records.begin(), records.end(),
+                 [](const EdgeLogRecord &a, const EdgeLogRecord &b) {
+                     return a.op_id < b.op_id;
+                 });
+            return records_valid > 0;
+        }
+        records.clear();
+        records_valid = 0;
+        input.clear();
+        input.seekg(0, ios::beg);
+    }
+
+    if (file_size % static_cast<streamoff>(sizeof(EdgeLogEntry)) != 0) {
+        return false;
+    }
+
     EdgeLogEntry entry;
     while (input.read(reinterpret_cast<char *>(&entry), sizeof(entry))) {
         if (entry.op_type != EDGE_LOG_INSERT &&
