@@ -360,6 +360,7 @@ int32_t global_blk_id = 0;
 // int32_t global_cache_blk = 0;
 atomic<int> global_cache_blk(0);
 int32_t cache_blk_threshold = 200000;
+int32_t query_prefetch_block_limit = 0;
 atomic<int64_t> global_pending_edge_count(0);
 int64_t pending_merge_threshold = 4000000;
 bool global_debug_pending_merge = false;

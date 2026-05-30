@@ -73,6 +73,14 @@ static void print_usage(const char *program)
          << cache_blk_threshold << ")" << endl;
     cerr << "  --pending-merge-threshold <n>: merge pending PMA edges after n queued edges (default "
          << pending_merge_threshold << ")" << endl;
+    cerr << "  --batch-size <n>: directed edges per maintenance batch (default "
+         << global_batch_size << ")" << endl;
+    cerr << "  --run-queries: run BFS, PageRank, and WCC after graph maintenance" << endl;
+    cerr << "  --query-cache-limit <n>: accepted for compatibility; query block cache is disabled" << endl;
+    cerr << "  --disable-query-cache: accepted for compatibility; query block cache is disabled" << endl;
+    cerr << "  --query-prefetch-blocks <n>: prefetch up to n high-degree query blocks before running queries (default 0)" << endl;
+    cerr << "  --query-source <vid>: BFS source vertex for --run-queries (default 1)" << endl;
+    cerr << "  --pagerank-iters <n>: PageRank iterations for --run-queries (default 20)" << endl;
     cerr << "  --debug-pending-merge: print block values after pending merge/rebalance" << endl;
     cerr << "  --zone-writer: use zone-serial writer when flushing queued/parallel updates" << endl;
     cerr << "  --zone-class: place hot/cold/hub vertices into separate zone pools" << endl;
@@ -122,6 +130,9 @@ int main(int argc, char* argv[]) {
     bool recovery_test = false;
     bool skip_final_dump = true;
     bool print_dram_metadata = false;
+    bool run_queries = false;
+    int query_source = 1;
+    int pagerank_iters = 20;
     vector<pair<int32_t, int32_t>> insert_edges;
     vector<pair<int32_t, int32_t>> delete_edges;
     for (int argi = 3; argi < argc; argi++) {
@@ -132,6 +143,60 @@ int main(int argc, char* argv[]) {
             shuffle_edges = true;
         } else if (arg == "--print-dram-metadata") {
             print_dram_metadata = true;
+        } else if (arg == "--run-queries") {
+            run_queries = true;
+        } else if (arg == "--query-cache-limit") {
+            if (argi + 1 >= argc) {
+                cerr << "--query-cache-limit requires <n>" << endl;
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            int threshold = 0;
+            if (!parse_int_arg(argv[argi + 1], threshold) || threshold <= 0) {
+                cerr << "Invalid query cache limit: " << argv[argi + 1] << endl;
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            argi += 1;
+        } else if (arg == "--disable-query-cache") {
+        } else if (arg == "--query-prefetch-blocks") {
+            if (argi + 1 >= argc) {
+                cerr << "--query-prefetch-blocks requires <n>" << endl;
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            int threshold = 0;
+            if (!parse_int_arg(argv[argi + 1], threshold) || threshold < 0) {
+                cerr << "Invalid query prefetch block limit: " << argv[argi + 1] << endl;
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            query_prefetch_block_limit = threshold;
+            argi += 1;
+        } else if (arg == "--query-source") {
+            if (argi + 1 >= argc) {
+                cerr << "--query-source requires <vid>" << endl;
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            if (!parse_int_arg(argv[argi + 1], query_source)) {
+                cerr << "Invalid query source: " << argv[argi + 1] << endl;
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            argi += 1;
+        } else if (arg == "--pagerank-iters") {
+            if (argi + 1 >= argc) {
+                cerr << "--pagerank-iters requires <n>" << endl;
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            if (!parse_int_arg(argv[argi + 1], pagerank_iters) || pagerank_iters <= 0) {
+                cerr << "Invalid PageRank iterations: " << argv[argi + 1] << endl;
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            argi += 1;
         } else if (arg == "--debug-pending-merge") {
             global_debug_pending_merge = true;
         } else if (arg == "--compact-delete") {
@@ -180,6 +245,20 @@ int main(int argc, char* argv[]) {
                 return EXIT_FAILURE;
             }
             pending_merge_threshold = threshold;
+            argi += 1;
+        } else if (arg == "--batch-size") {
+            if (argi + 1 >= argc) {
+                cerr << "--batch-size requires <n>" << endl;
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            int batch_size = 0;
+            if (!parse_int_arg(argv[argi + 1], batch_size) || batch_size <= 0) {
+                cerr << "Invalid batch size: " << argv[argi + 1] << endl;
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            global_batch_size = batch_size;
             argi += 1;
         } else if (arg == "--zone-writer") {
             use_zone_writer = true;
@@ -308,10 +387,12 @@ int main(int argc, char* argv[]) {
     // cout << "test 0: " << zns.zones_info[0].blk_info_vec[0].src << endl;
     report_device_info(zns.info);
     // report_zones_info(zns.zones, zns.nr_zones);
+    cout << "[zoneGraph] reset_zns begin" << endl;
     if (!recover_zns && zbd_reset_zones(zns.dev_fd, 0, 0) != 0) {
         perror("zbd_reset_zones");
         return EXIT_FAILURE;
     }
+    cout << "[zoneGraph] reset_zns done" << endl;
     if (!recover_zns) {
         reset_zns_write_pointers();
         resetRedoLogFile();
@@ -326,6 +407,7 @@ int main(int argc, char* argv[]) {
     }
 
     bool stream_load = (mode == "parallel2" && dataset_id == 22);
+    cout << "[zoneGraph] load_graph begin" << endl;
     if (stream_load) {
         if (scan_graph_metadata(dataPath) != 0) {
             return EXIT_FAILURE;
@@ -403,6 +485,9 @@ int main(int argc, char* argv[]) {
     if (print_dram_metadata) {
         print_dram_metadata_usage();
     }
+    if (run_queries) {
+        run_query_benchmarks(query_source, pagerank_iters, skip_final_dump ? "" : "BEFORE_DUMP");
+    }
     if (!skip_final_dump && global_cache_blk > 0) {
         if (use_zone_writer) {
             dumpToZoneZoneSerial();
@@ -412,6 +497,9 @@ int main(int argc, char* argv[]) {
             dumpToZone();
         }
         global_cache_blk = 0;
+    }
+    if (run_queries && !skip_final_dump) {
+        run_query_benchmarks(query_source, pagerank_iters, "AFTER_DUMP");
     }
     flushZNSRedoLog();
     closeRedoLogFile();
