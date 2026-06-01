@@ -46,7 +46,7 @@ def plot(output_dir: Path):
     x = np.arange(len(DATASETS))
     width = 0.18
 
-    fig, ax = plt.subplots(figsize=(6.8, 2.75))
+    fig, ax = plt.subplots(figsize=(7.2, 2.9))
 
     colors = {
         "zone_algorithm": "#2F5D8C",
@@ -119,7 +119,7 @@ def plot(output_dir: Path):
     ax.set_yscale("log")
     ax.set_ylabel("Maintenance time (s)")
     ax.set_xticks(x)
-    ax.set_xticklabels(DATASETS, rotation=18, ha="right")
+    ax.set_xticklabels(DATASETS, rotation=0, ha="center")
     ax.set_ylim(0.08, 500)
     ax.grid(axis="y", which="major", linestyle="--", linewidth=0.45, alpha=0.45)
     ax.set_axisbelow(True)
@@ -139,7 +139,7 @@ def plot(output_dir: Path):
 
     fig.tight_layout(pad=0.35)
     fig.savefig(output_dir / "edge_insertion_maintenance.pdf", bbox_inches="tight")
-    fig.savefig(output_dir / "edge_insertion_maintenance.png", dpi=300, bbox_inches="tight")
+    fig.savefig(output_dir / "edge_insertion_maintenance.png", dpi=600, bbox_inches="tight")
 
 
 if __name__ == "__main__":
