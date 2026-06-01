@@ -6,6 +6,7 @@
 #include <climits>
 #include <iostream>
 #include <cstdlib>
+#include <fstream>
 // #include <chrono> // test git
 // #include "global.h"
 using namespace std;
@@ -65,6 +66,8 @@ static void print_usage(const char *program)
     cerr << "  --shuffle-edges: shuffle loaded edge order with a fixed seed before graph maintenance" << endl;
     cerr << "  --insert <src> <dst>: insert an undirected edge after build" << endl;
     cerr << "  --delete <src> <dst>: delete an undirected edge after insertion" << endl;
+    cerr << "  --delete-file <path>: delete undirected edges listed in a text file after build" << endl;
+    cerr << "  --delete-parallel: execute --delete-file with OpenMP workers" << endl;
     cerr << "  --compact-delete: compact PMA layout after each PMA deletion" << endl;
     cerr << "  --no-cache: disable cache_buf and route updates directly to PMA blocks" << endl;
     cerr << "  --cache-threshold <n>: cache up to n neighbors per vertex before PMA migration (0-"
@@ -135,6 +138,8 @@ int main(int argc, char* argv[]) {
     int pagerank_iters = 20;
     vector<pair<int32_t, int32_t>> insert_edges;
     vector<pair<int32_t, int32_t>> delete_edges;
+    string delete_file;
+    bool delete_parallel = false;
     for (int argi = 3; argi < argc; argi++) {
         string arg = argv[argi];
         if (arg == "--print-pma") {
@@ -306,8 +311,9 @@ int main(int argc, char* argv[]) {
             global_redo_log_enabled = true;
         } else if (arg == "--recovery-test") {
             global_zns_record_enabled = true;
-            global_redo_log_enabled = true;
+            global_redo_log_enabled = false;
             recovery_test = true;
+            skip_final_dump = false;
         } else if (arg == "--recover-zns") {
             global_zns_record_enabled = true;
             global_redo_log_enabled = true;
@@ -350,6 +356,16 @@ int main(int argc, char* argv[]) {
             }
             delete_edges.push_back({delete_src, delete_dst});
             argi += 2;
+        } else if (arg == "--delete-file") {
+            if (argi + 1 >= argc) {
+                cerr << "--delete-file requires <path>" << endl;
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            delete_file = argv[argi + 1];
+            argi += 1;
+        } else if (arg == "--delete-parallel") {
+            delete_parallel = true;
         } else {
             if (mode_set) {
                 cerr << "Invalid option: " << arg << endl;
@@ -361,6 +377,10 @@ int main(int argc, char* argv[]) {
         }
     }
     string dataPath = data_path[dataset_id];
+    global_recovery_stream_redo =
+        (dataset_id == 2 || dataset_id == 21 ||
+         dataPath.find("LiveJournal") != string::npos ||
+         dataPath.find("livejournal") != string::npos);
     THREAD_NUM = thread_num;
     // 初始化全局 ZNS 设备状态
 
@@ -395,7 +415,7 @@ int main(int argc, char* argv[]) {
     cout << "[zoneGraph] reset_zns done" << endl;
     if (!recover_zns) {
         reset_zns_write_pointers();
-        resetRedoLogFile();
+        resetRedoLogBuffer();
     }
 
     if (recover_zns) {
@@ -481,6 +501,75 @@ int main(int argc, char* argv[]) {
         cout << "Delete edge (" << edge.first << ", " << edge.second << "): "
              << (deleted ? "deleted" : "not found") << endl;
     }
+    if (!delete_file.empty()) {
+        vector<pair<int32_t, int32_t>> file_delete_edges;
+        ifstream input(delete_file);
+        if (!input) {
+            cerr << "Failed to open delete file: " << delete_file << endl;
+            return EXIT_FAILURE;
+        }
+        int32_t src = 0;
+        int32_t dst = 0;
+        while (input >> src >> dst) {
+            file_delete_edges.push_back({src, dst});
+        }
+
+        double delete_dump_before = total_dump_time;
+        int64_t delete_dump_count_before = total_dump_count;
+        double delete_gc_before = total_gc_time;
+        int64_t delete_gc_count_before = total_gc_count;
+        double delete_start_t = get_current_time();
+        int64_t deleted_undirected = 0;
+        int64_t deleted_directed = 0;
+
+        if (delete_parallel) {
+            shared_lock<std::shared_timed_mutex> graph_lock(global_query_update_mutex);
+            #pragma omp parallel for reduction(+ : deleted_undirected, deleted_directed) schedule(dynamic, 1024)
+            for (int64_t i = 0; i < static_cast<int64_t>(file_delete_edges.size()); i++) {
+                const auto &edge = file_delete_edges[i];
+                bool forward_deleted = graph_delete_directed_edge_locked(edge.first, edge.second);
+                bool backward_deleted = graph_delete_directed_edge_locked(edge.second, edge.first);
+                if (forward_deleted || backward_deleted) {
+                    deleted_undirected++;
+                }
+                if (forward_deleted) {
+                    deleted_directed++;
+                }
+                if (backward_deleted) {
+                    deleted_directed++;
+                }
+            }
+        } else {
+            for (const auto &edge : file_delete_edges) {
+                bool forward_deleted = graph_delete_directed_edge(edge.first, edge.second);
+                bool backward_deleted = graph_delete_directed_edge(edge.second, edge.first);
+                if (forward_deleted || backward_deleted) {
+                    deleted_undirected++;
+                }
+                if (forward_deleted) {
+                    deleted_directed++;
+                }
+                if (backward_deleted) {
+                    deleted_directed++;
+                }
+            }
+        }
+        double delete_total_t = get_current_time() - delete_start_t;
+        merge_all_pending_insert_buffers();
+
+        cout << "DELETE_FILE=" << delete_file << endl;
+        cout << "DELETE_PARALLEL=" << (delete_parallel ? 1 : 0) << endl;
+        cout << "DELETE_INPUT_UNDIRECTED=" << file_delete_edges.size() << endl;
+        cout << "DELETE_FOUND_UNDIRECTED=" << deleted_undirected << endl;
+        cout << "DELETE_FOUND_DIRECTED=" << deleted_directed << endl;
+        cout << "DELETE_TOTAL_SEC=" << delete_total_t << endl;
+        cout << "DELETE_THROUGHPUT_DIRECTED_MEPS="
+             << (delete_total_t > 0.0 ? (deleted_directed / delete_total_t / 1000000.0) : 0.0) << endl;
+        cout << "DELETE_DUMP_COUNT=" << (total_dump_count - delete_dump_count_before) << endl;
+        cout << "DELETE_DUMP_TOTAL_SEC=" << (total_dump_time - delete_dump_before) << endl;
+        cout << "DELETE_GC_COUNT=" << (total_gc_count - delete_gc_count_before) << endl;
+        cout << "DELETE_GC_TOTAL_SEC=" << (total_gc_time - delete_gc_before) << endl;
+    }
     merge_all_pending_insert_buffers();
     if (print_dram_metadata) {
         print_dram_metadata_usage();
@@ -498,14 +587,17 @@ int main(int argc, char* argv[]) {
         }
         global_cache_blk = 0;
     }
+    if (recovery_test) {
+        persist_cache_vertices_as_records();
+    }
     if (run_queries && !skip_final_dump) {
         run_query_benchmarks(query_source, pagerank_iters, "AFTER_DUMP");
     }
-    flushZNSRedoLog();
-    closeRedoLogFile();
-
     if (recovery_test) {
         run_recovery_experiment_from_zns();
+    } else {
+        flushZNSRedoLog();
+        stopZNSRedoWriter();
     }
 
     if (print_pma) {

@@ -19,8 +19,9 @@ void beginZNSEpoch(void);
 void commitZNSEpoch(void);
 uint64_t appendZNSRedoLog(uint32_t op_type, int32_t src, int32_t dst);
 void flushZNSRedoLog(void);
-void resetRedoLogFile(void);
-void closeRedoLogFile(void);
+void resetRedoLogBuffer(void);
+void startZNSRedoWriter(void);
+void stopZNSRedoWriter(void);
 bool readZNSRecordHeader(int fd, ZNSBlockHeader &header, unsigned long long wp);
 bool readZNSRecordChecked(int fd, ZNSBlockHeader &header, int32_t* array,
                           size_t size, unsigned long long wp);
@@ -148,15 +149,23 @@ int zns_open(void) {
 	}
 	nr_blocks_perzone = zns.nr_blocks_perzone;
 	if (global_zns_record_enabled) {
-		if (zns.nr_zones < 4) {
-			fprintf(stderr, "ZNS record mode requires at least 4 zones for data, GC, redo log, and metadata\n");
+		const int32_t redo_zone_count = zns.nr_zones >= 7 ? 4 : 1;
+		if (zns.nr_zones < static_cast<unsigned int>(redo_zone_count + 3)) {
+			fprintf(stderr, "ZNS record mode requires enough zones for data, GC, redo log, and metadata\n");
 			zns_close();
 			return -1;
 		}
 		global_meta_zone = zns.nr_zones - 1; // 最后一个 zone 专门追加 commit record
-		global_redo_zone = zns.nr_zones - 2; // 倒数第二个 zone 专门追加 redo log
-		global_empty_zone = zns.nr_zones - 3;  // 倒数第三个 zone 作为 GC 空白缓冲区
-		global_num_queues = zns.nr_zones - 3; // 其余 zone 用于 data record 分配
+		global_redo_zones.clear();
+		for (int32_t zidx = static_cast<int32_t>(zns.nr_zones) - 1 - redo_zone_count;
+		     zidx < static_cast<int32_t>(zns.nr_zones) - 1;
+		     zidx++) {
+			global_redo_zones.push_back(zidx);
+		}
+		global_current_redo_zone_idx = 0;
+		global_redo_zone = global_redo_zones.front();
+		global_empty_zone = zns.nr_zones - 2 - redo_zone_count;  // redo zones 前一个 zone 作为 GC 空白缓冲区
+		global_num_queues = zns.nr_zones - 2 - redo_zone_count; // 其余 zone 用于 data record 分配
 		global_meta_wp = static_cast<unsigned long long>(global_meta_zone) *
 		                 static_cast<unsigned long long>(zns.zone_size);
 		global_redo_wp = static_cast<unsigned long long>(global_redo_zone) *
@@ -166,6 +175,8 @@ int zns_open(void) {
 		global_meta_wp = 0;
 		global_redo_zone = -1;
 		global_redo_wp = 0;
+		global_redo_zones.clear();
+		global_current_redo_zone_idx = 0;
 		global_empty_zone = zns.nr_zones - 1;  // 默认把最后一个 zone 作为空白缓冲区
 		global_num_queues = zns.nr_zones - 1; // 其余 zone 用于分配可写块
 	}
@@ -457,7 +468,8 @@ bool garbage_collection() {
 	int32_t* array = new int32_t[PM_BLK_SIZE];
 	for (int zidx = 0; zidx < zns.nr_zones; zidx++) {
 		if (zidx == global_empty_zone || zidx == pre_empty_zone ||
-		    zidx == global_meta_zone || zidx == global_redo_zone) {
+		    zidx == global_meta_zone ||
+		    find(global_redo_zones.begin(), global_redo_zones.end(), zidx) != global_redo_zones.end()) {
 			continue;
 		}
 		wp = global_empty_zone * zns.zone_size;  // 空白 zone 起始位置
@@ -809,25 +821,32 @@ static uint32_t zns_redo_page_checksum(const EdgeLogPageHeader &header,
     return hash;
 }
 
-static void ensureRedoLogFileOpenLocked(const char *mode);
-
-static void flushZNSRedoLogLocked(void)
+static void writeZNSRedoLogPage(const EdgeLogEntry *entries, uint32_t count)
 {
-    if (!global_zns_record_enabled || !global_redo_log_enabled ||
-        global_redo_page_count == 0) {
+    if (count == 0) {
         return;
     }
     if (zns.dev_fd == -1) {
         perror("Failed to open file for redo log writing");
         exit(EXIT_FAILURE);
     }
-    if (global_redo_zone < 0) {
+    if (global_redo_zone < 0 || global_redo_zones.empty()) {
         std::cerr << "ZNS redo log requires a dedicated redo zone." << std::endl;
         exit(EXIT_FAILURE);
     }
     if (global_redo_wp + zns_alloc_unit_size() >
         global_zone_write_limit[global_redo_zone]) {
-        std::cerr << "No free space left in ZNS redo log zone." << std::endl;
+        global_current_redo_zone_idx++;
+        if (global_current_redo_zone_idx >= static_cast<int32_t>(global_redo_zones.size())) {
+            std::cerr << "No free space left in ZNS redo log zones." << std::endl;
+            exit(EXIT_FAILURE);
+        }
+        global_redo_zone = global_redo_zones[global_current_redo_zone_idx];
+        global_redo_wp = static_cast<unsigned long long>(global_redo_zone) *
+                         static_cast<unsigned long long>(zns.zone_size);
+    }
+    if (count > ZNS_REDO_ENTRIES_PER_PAGE) {
+        std::cerr << "Too many entries for one ZNS redo log page." << std::endl;
         exit(EXIT_FAILURE);
     }
 
@@ -838,78 +857,195 @@ static void flushZNSRedoLogLocked(void)
     memset(&header, 0, sizeof(header));
     header.magic = ZNS_REDO_PAGE_MAGIC;
     header.version = ZNS_BLOCK_VERSION;
-    header.record_count = global_redo_page_count;
-    header.payload_bytes = global_redo_page_count * sizeof(EdgeLogEntry);
-    header.first_op_id = global_redo_page_entries[0].op_id;
-    header.last_op_id = global_redo_page_entries[global_redo_page_count - 1].op_id;
+    header.record_count = count;
+    header.payload_bytes = count * sizeof(EdgeLogEntry);
+    header.first_op_id = 0;
+    header.last_op_id = 0;
     header.tail_magic = ZNS_REDO_PAGE_TAIL_MAGIC;
-    header.checksum = zns_redo_page_checksum(header, global_redo_page_entries);
+    header.checksum = zns_redo_page_checksum(header, entries);
 
     memcpy(raw, &header, sizeof(header));
     memcpy(raw + sizeof(EdgeLogPageHeader),
-           global_redo_page_entries,
+           entries,
            header.payload_bytes);
-
-    ensureRedoLogFileOpenLocked("ab");
-    if (global_redo_log_file != nullptr &&
-        fwrite(raw, ZNS_RECORD_SIZE, 1, global_redo_log_file) != 1) {
-        perror("Failed to write redo log file page");
-        exit(EXIT_FAILURE);
-    }
 
     unsigned long long wp = global_redo_wp;
     global_redo_wp += zns_alloc_unit_size();
     checkedZoneWrite(zns.dev_fd, raw, ZNS_RECORD_SIZE, wp,
                      "Failed to write ZNS redo log page");
-    global_redo_page_count = 0;
 }
 
-static void ensureRedoLogFileOpenLocked(const char *mode)
+static void enqueueZNSRedoPendingLocked(unique_lock<std::mutex> &lock)
 {
-    if (!global_redo_file_enabled || !global_redo_log_enabled) {
+    if (!global_zns_record_enabled || !global_redo_log_enabled ||
+        global_redo_pending_entries.empty()) {
         return;
     }
-    if (global_redo_log_file != nullptr) {
-        return;
-    }
-    global_redo_log_file = fopen(global_redo_log_file_path.c_str(), mode);
-    if (global_redo_log_file == nullptr) {
-        perror("Failed to open redo log file");
-        exit(EXIT_FAILURE);
-    }
-    static char redo_file_buffer[4 * 1024 * 1024];
-    setvbuf(global_redo_log_file, redo_file_buffer, _IOFBF, sizeof(redo_file_buffer));
+    size_t entry_count = global_redo_pending_entries.size();
+    global_redo_writer_space_cv.wait(lock, [entry_count] {
+        return global_redo_writer_stop ||
+               global_redo_writer_queued_entries + entry_count <=
+               global_redo_max_queued_entries;
+    });
+    vector<EdgeLogEntry> entries;
+    entries.swap(global_redo_pending_entries);
+    global_redo_writer_queued_entries += entry_count;
+    global_redo_write_queue.push_back(std::move(entries));
+    global_redo_writer_cv.notify_one();
 }
 
-void resetRedoLogFile(void)
+static void writeZNSRedoLogEntries(const vector<EdgeLogEntry> &entries)
 {
-    if (!global_redo_file_enabled || !global_redo_log_enabled) {
+    static const size_t REDO_BATCH_PAGES = 2048;
+    size_t offset = 0;
+    while (offset < entries.size()) {
+        if (global_redo_zone < 0 || global_redo_zones.empty()) {
+            std::cerr << "ZNS redo log requires a dedicated redo zone." << std::endl;
+            exit(EXIT_FAILURE);
+        }
+        if (global_redo_wp + zns_alloc_unit_size() >
+            global_zone_write_limit[global_redo_zone]) {
+            global_current_redo_zone_idx++;
+            if (global_current_redo_zone_idx >= static_cast<int32_t>(global_redo_zones.size())) {
+                std::cerr << "No free space left in ZNS redo log zones." << std::endl;
+                exit(EXIT_FAILURE);
+            }
+            global_redo_zone = global_redo_zones[global_current_redo_zone_idx];
+            global_redo_wp = static_cast<unsigned long long>(global_redo_zone) *
+                             static_cast<unsigned long long>(zns.zone_size);
+        }
+
+        size_t remaining_entries = entries.size() - offset;
+        size_t pages_needed =
+            (remaining_entries + ZNS_REDO_ENTRIES_PER_PAGE - 1) /
+            ZNS_REDO_ENTRIES_PER_PAGE;
+        size_t zone_pages_left =
+            (global_zone_write_limit[global_redo_zone] - global_redo_wp) /
+            zns_alloc_unit_size();
+        size_t batch_pages = min(REDO_BATCH_PAGES, min(pages_needed, zone_pages_left));
+        if (batch_pages == 0) {
+            continue;
+        }
+
+        vector<char> raw_pages(batch_pages * ZNS_RECORD_SIZE, 0);
+        for (size_t page_idx = 0; page_idx < batch_pages; page_idx++) {
+            uint32_t count = static_cast<uint32_t>(
+                min<size_t>(ZNS_REDO_ENTRIES_PER_PAGE, entries.size() - offset));
+            char *raw = raw_pages.data() + page_idx * ZNS_RECORD_SIZE;
+
+            EdgeLogPageHeader header;
+            memset(&header, 0, sizeof(header));
+            header.magic = ZNS_REDO_PAGE_MAGIC;
+            header.version = ZNS_BLOCK_VERSION;
+            header.record_count = count;
+            header.payload_bytes = count * sizeof(EdgeLogEntry);
+            header.first_op_id = 0;
+            header.last_op_id = 0;
+            header.tail_magic = ZNS_REDO_PAGE_TAIL_MAGIC;
+            header.checksum = zns_redo_page_checksum(header, entries.data() + offset);
+
+            memcpy(raw, &header, sizeof(header));
+            memcpy(raw + sizeof(EdgeLogPageHeader),
+                   entries.data() + offset,
+                   header.payload_bytes);
+            offset += count;
+        }
+
+        unsigned long long wp = global_redo_wp;
+        global_redo_wp += raw_pages.size();
+        checkedZoneWriteBatch(zns.dev_fd, raw_pages.data(), raw_pages.size(), wp,
+                              "Failed to write ZNS redo log batch");
+    }
+}
+
+static void znsRedoWriterLoop(void)
+{
+    while (true) {
+        vector<EdgeLogEntry> entries;
+        {
+            unique_lock<std::mutex> lock(global_redo_log_mutex);
+            global_redo_writer_cv.wait(lock, [] {
+                return global_redo_writer_stop || !global_redo_write_queue.empty();
+            });
+            if (global_redo_writer_stop && global_redo_write_queue.empty()) {
+                break;
+            }
+            entries = std::move(global_redo_write_queue.front());
+            global_redo_write_queue.pop_front();
+            global_redo_writer_queued_entries -= entries.size();
+            global_redo_writer_space_cv.notify_all();
+            global_redo_writer_active_batches++;
+        }
+
+        writeZNSRedoLogEntries(entries);
+
+        {
+            lock_guard<std::mutex> lock(global_redo_log_mutex);
+            global_redo_writer_active_batches--;
+            if (global_redo_pending_entries.empty() &&
+                global_redo_write_queue.empty() &&
+                global_redo_writer_active_batches == 0) {
+                global_redo_writer_drained_cv.notify_all();
+            }
+        }
+    }
+}
+
+void startZNSRedoWriter(void)
+{
+    lock_guard<std::mutex> lock(global_redo_log_mutex);
+    if (!global_zns_record_enabled || !global_redo_log_enabled ||
+        global_redo_writer_running) {
+        return;
+    }
+    global_redo_writer_stop = false;
+    global_redo_writer_running = true;
+    global_redo_writer_thread = thread(znsRedoWriterLoop);
+}
+
+void resetRedoLogBuffer(void)
+{
+    if (!global_redo_log_enabled) {
         return;
     }
     lock_guard<std::mutex> lock(global_redo_log_mutex);
-    if (global_redo_log_file != nullptr) {
-        fclose(global_redo_log_file);
-        global_redo_log_file = nullptr;
-    }
-    ensureRedoLogFileOpenLocked("wb");
-}
-
-void closeRedoLogFile(void)
-{
-    lock_guard<std::mutex> lock(global_redo_log_mutex);
-    if (global_redo_log_file != nullptr) {
-        fflush(global_redo_log_file);
-        fclose(global_redo_log_file);
-        global_redo_log_file = nullptr;
-    }
+    global_redo_pending_entries.clear();
+    global_redo_write_queue.clear();
+    global_redo_writer_queued_entries = 0;
+    global_redo_writer_active_batches = 0;
+    global_redo_writer_stop = false;
+    global_redo_writer_space_cv.notify_all();
 }
 
 void flushZNSRedoLog(void)
 {
-    lock_guard<std::mutex> lock(global_redo_log_mutex);
-    flushZNSRedoLogLocked();
-    if (global_redo_log_file != nullptr) {
-        fflush(global_redo_log_file);
+    unique_lock<std::mutex> lock(global_redo_log_mutex);
+    enqueueZNSRedoPendingLocked(lock);
+    global_redo_writer_drained_cv.wait(lock, [] {
+        return global_redo_pending_entries.empty() &&
+               global_redo_write_queue.empty() &&
+               global_redo_writer_active_batches == 0;
+    });
+}
+
+void stopZNSRedoWriter(void)
+{
+    flushZNSRedoLog();
+    {
+        lock_guard<std::mutex> lock(global_redo_log_mutex);
+        if (!global_redo_writer_running) {
+            return;
+        }
+        global_redo_writer_stop = true;
+        global_redo_writer_cv.notify_all();
+    }
+    if (global_redo_writer_thread.joinable()) {
+        global_redo_writer_thread.join();
+    }
+    {
+        lock_guard<std::mutex> lock(global_redo_log_mutex);
+        global_redo_writer_running = false;
+        global_redo_writer_stop = false;
     }
 }
 
@@ -930,22 +1066,22 @@ uint64_t appendZNSRedoLog(uint32_t op_type, int32_t src, int32_t dst)
 
     uint64_t op_id = 0;
     {
-        lock_guard<std::mutex> lock(global_redo_log_mutex);
-        if (global_redo_page_count >= ZNS_REDO_ENTRIES_PER_PAGE) {
-            flushZNSRedoLogLocked();
+        unique_lock<std::mutex> lock(global_redo_log_mutex);
+        if (!global_redo_writer_running) {
+            global_redo_writer_stop = false;
+            global_redo_writer_running = true;
+            global_redo_writer_thread = thread(znsRedoWriterLoop);
         }
-
-        EdgeLogEntry &entry = global_redo_page_entries[global_redo_page_count++];
+        global_redo_pending_entries.emplace_back();
+        EdgeLogEntry &entry = global_redo_pending_entries.back();
         memset(&entry, 0, sizeof(entry));
-        entry.op_id = global_next_op_id++;
         entry.src = src;
         entry.dst = dst;
         entry.op_type = op_type;
-        op_id = entry.op_id;
+        op_id = global_next_op_id++;
         global_last_applied_op_id = op_id;
-
-        if (global_redo_page_count >= ZNS_REDO_ENTRIES_PER_PAGE) {
-            flushZNSRedoLogLocked();
+        if (global_redo_pending_entries.size() >= global_redo_flush_entry_threshold) {
+            enqueueZNSRedoPendingLocked(lock);
         }
     }
     return op_id;
@@ -1041,7 +1177,6 @@ void commitZNSEpoch(void)
     if (!global_zns_record_enabled) {
         return;
     }
-    flushZNSRedoLog();
 
     ZNSBlockHeader header;
     memset(&header, 0, sizeof(header));
@@ -1172,7 +1307,6 @@ bool decodeZNSRedoLogPageRaw(const char raw[ZNS_RECORD_SIZE],
             record.magic = ZNS_REDO_MAGIC;
             record.version = ZNS_BLOCK_VERSION;
             record.op_type = entries[i].op_type;
-            record.op_id = entries[i].op_id;
             record.src = entries[i].src;
             record.dst = entries[i].dst;
             record.tail_magic = ZNS_REDO_TAIL_MAGIC;

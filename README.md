@@ -1,1091 +1,240 @@
-# zoneGraph 项目说明
+# ZoneGraph README
 
-本文档用于快速恢复项目上下文。当前工程围绕动态图邻接表在 ZNS SSD 上的存储、更新、GC 和 restart recovery 进行实验。这里的 recovery 主要指服务器重启后从 ZNS records 重建 DRAM 中的运行时 metadata，以及通过 redo log 补齐尚未 checkpoint 到 ZNS DATA record 的 cache-only 小度顶点更新；不把真实突然断电下的设备持久化顺序作为实验验证目标。当前默认使用 ZNS-native record 路径。
+ZoneGraph 是一个面向 ZNS SSD 的动态图存储原型系统。它面向频繁边插入、边删除和图查询的动态图场景，目标是在保持图更新效率的同时，将物理写入组织成 ZNS 友好的顺序块写。
 
-## 1. 总体思路
-
-每个顶点维护一个邻接表。小度顶点优先放在 DRAM 的 `cache_buf`，超过阈值后迁移到 PMA。PMA 的物理块可以暂存在 DRAM，也可以刷写到 ZNS 上。
-
-核心数据流：
+系统核心思想：
 
 ```text
-dataset edge
-  -> graph_insert_directed_edge()
-  -> cache_buf 或 PMA block
-  -> dumpToZone*()
-  -> ZNS physical block / ZNS record
-  -> graph_recovery() 或 recover_graph_from_zns_records()
+边级图更新
+  -> DRAM 中的 degree-aware 维护
+  -> PMA 风格邻接块
+  -> ZNS 上的 append-only record
 ```
 
-历史 payload-only 路径：
+本文档只保留系统框架、实验设置和写作相关说明，不再维护函数级代码导览。
+
+## 1. 系统概览
+
+ZoneGraph 以顶点为单位组织邻接数据。每个顶点根据度数选择不同表示：
+
+- 低度顶点：邻居保留在 DRAM cache 中；
+- 高度顶点：邻居迁移到 PMA 风格的稀疏邻接块；
+- 邻接块：作为固定大小的逻辑块进行维护；
+- 持久化：dirty block 以 append-only ZNS record 写入设备。
+
+核心映射关系：
 
 ```text
-[payload: 64 * int32_t]
-pm_blk.global_wp = payload 起始地址
-分配步长 = ZONE_BLK_SIZE
+(vertex id, logical adjacency block id) -> latest ZNS record
 ```
 
-默认 ZNS-native record 路径：
+更新不会原地覆盖旧 record，而是追加写新版本。旧版本变为 invalid block，后续由 GC 回收。
+
+## 2. 主要设计
+
+### 2.1 Degree-Aware 邻接管理
+
+真实图中大量顶点度数很小。ZoneGraph 避免将这些低度顶点过早物化为 ZNS block，而是优先保留在 DRAM 中。这样可以降低 dump 次数、减少 ZNS 写入，并改善低度顶点查询路径。
+
+高度顶点则使用 PMA 风格邻接块，使插入、删除和查询都能在较稳定的块级结构上执行。
+
+### 2.2 PMA 风格块级维护
+
+高度顶点的邻接表被划分成带空隙的 PMA block。边插入和删除优先影响局部块或局部窗口，避免每次更新都重写完整邻接表。
+
+这个设计将大量边级更新转化为较少的块级 rewrite，是 ZoneGraph 连接动态图语义和 ZNS 写入约束的关键。
+
+### 2.3 ZNS 友好的追加写
+
+ZoneGraph 将修改后的邻接块作为 ZNS record 追加写入。每个 record 自带逻辑身份信息，因此系统可以在运行时和 recovery 时恢复逻辑块到物理位置的映射。
+
+### 2.4 Block-Level GC
+
+当邻接块被更新后，旧物理版本失效。GC 以 zone 为回收单位，搬迁仍然 live 的邻接块，并 reset victim zone。
+
+当前实验比较：
+
+- Basic GC；
+- Greedy GC；
+- ATZ-GC。
+
+ATZ-GC 通过冷热感知减少 cold live block 被反复搬迁。
+
+### 2.5 Restart Recovery
+
+Recovery 从 ZNS record 重建 DRAM 中的图 metadata 和逻辑到物理映射，不需要重新加载原始图文件。
+
+当前 recovery 实验关注 restart metadata recovery，统计恢复总时间并进行正确性验证。它不是完整掉电一致性协议实验。
+
+### 2.6 Edge Deletion
+
+删除边时，ZoneGraph 先在 DRAM/PMA 邻接结构中完成逻辑删除，物理持久化延后到块级 dump。删除实验按固定 directed delete attempts 统计时间。
+
+## 3. 实验集合
+
+### 3.1 Baseline 对比
+
+对比系统：
+
+- ZoneGraph；
+- LiveGraph；
+- LSMGraph；
+- MBFGraph。
+
+主要数据集：
+
+- `com-DBLP`
+- `com-Youtube`
+- `twitch-gamers`
+- `as-Skitter`
+- `soc-Pokec`
+- `soc-LiveJournal1`
+
+指标：
+
+- graph maintenance time；
+- BFS time；
+- PageRank time；
+- WCC time；
+- ZoneGraph before/after final dump query time。
+
+### 3.2 Cache Block Threshold 消融
+
+变量：
 
 ```text
-[ZNSBlockHeader][payload: 64 * int32_t][padding 到 512B]
-pm_blk.global_wp = record 起始地址
-分配步长 = ZNS_RECORD_SIZE
+50000
+100000
+200000
+1000000
 ```
 
-当前不加 `--zns-record` 也会使用带 header 的 record 格式；`--zns-record` 仅作为旧脚本兼容参数保留。
+目的：
 
-当前主要实验模块：
+- 分析 dump 频率对 maintenance/query 的影响；
+- 说明过大的阈值会使系统偏向 DRAM-only；
+- 支撑主实验中 cache block threshold 的选择。
+
+### 3.3 Degree-Aware 消融
+
+变量：
 
 ```text
-graph maintenance:
-  parallel2 并发插入，DRAM cache / PMA pending / batch dump 降低 ZNS 写放大。
-
-GC:
-  basic / greedy / ATZ-GC 三种 single-victim 策略，用 skew update workload 对比 GC 时间和搬迁量。
-
-recovery:
-  graph maintenance 后清空 DRAM metadata，从 ZNS DATA records + redo.log 重建，并抽样验证恢复正确性。
-```
-
-record 模式下会预留三个特殊 zone：
-
-```text
-0 .. global_num_queues - 1: data zone，用于 DATA record
-global_empty_zone:         GC 搬迁使用的空白 zone
-global_redo_zone:          redo log zone，只追加边更新日志
-global_meta_zone:          metadata zone，只追加 COMMIT record
-```
-
-当前约定：
-
-```cpp
-global_meta_zone = zns.nr_zones - 1;
-global_redo_zone = zns.nr_zones - 2;
-global_empty_zone = zns.nr_zones - 3;
-global_num_queues = zns.nr_zones - 3;
-```
-
-因此默认运行至少需要 4 个 zone：data、GC empty、redo log、metadata。
-
-### 1.1 ZNS zone block 划分与 PMA 映射
-
-项目显式把每个 ZNS zone 划分成固定大小的可写 block：
-
-```text
-payload-only 模式:
-  block size = ZONE_BLK_SIZE = PM_BLK_SIZE * sizeof(int32_t)
-
-record 模式:
-  block/record size = ZNS_RECORD_SIZE = 512B
-```
-
-每个顶点的 PMA 邻接表被切分为多个逻辑 PMA block：
-
-```text
-Vertex::blk_list[pma_blk_idx] -> pm_blk
-pm_blk.global_wp             -> ZNS physical offset
-```
-
-也就是说，系统维护的是：
-
-```text
-(src_vid, pma_blk_idx) -> ZNS zone block / ZNS record
-```
-
-更新时不原地覆盖旧 block，而是把受影响的 PMA block 作为新版本追加写到 ZNS，并更新 `pm_blk.global_wp`。旧版本通过 `global_zone_vec` 中的 zone/block metadata 失效，后续由 GC 搬迁或回收。record 模式下，`ZNSBlockHeader` 会持久化 `src_vid` 和 `pma_blk_idx`，因此重启恢复时可以扫描 ZNS records 重建该映射，而不依赖重启前的 DRAM 状态。
-
-## 2. 主要文件
-
-`main.cpp`
-
-程序入口、命令行参数解析、设备打开、zone reset、构图模式选择、额外插入/删除、打印、恢复入口。
-
-`global.h`
-
-全局常量、核心结构体和全局变量。重要结构包括：
-
-- `Vertex`：顶点状态，包含 `degree`、`cache_buf`、`blk_list`、`pma`、`update_count`、`vclass`。
-- `pm_blk`：顶点 PMA 的一个逻辑块描述，包含 `global_wp`、可选 DRAM `buf`，以及内存态 block meta。
-- `ZoneStatus` / `blk_info`：运行时 zone/block 到顶点逻辑块的映射。
-- `ZNSBlockHeader`：ZNS-native recovery 使用的持久化 record header。
-- `VertexClass`：`cold / hot / hub`。
-
-`utils.h`
-
-ZNS 设备打开、zone 信息、块分配队列、底层读写、zone metadata 标记、旧 GC 和 record 读写函数。关键函数：
-
-- `zns_open()`
-- `generate_block_baseline()`
-- `generate_block_opt()`
-- `requestMemoryBlocks()`
-- `writeBlockToZone()` / `readBlockFromZone()`
-- `writeZNSRecord()` / `readZNSRecordPayload()`
-- `beginZNSEpoch()` / `commitZNSEpoch()`
-- `readZNSRecordChecked()`
-- `mark_zone()` / `invalidBlock()` / `test_block()`
-- `cacheBlock()`
-
-`pma.h`
-
-PMA 查找、插入、删除、扩容、刷盘、恢复和实验策略。关键函数：
-
-- `binary_pma_find()`
-- `pma_insert()`
-- `pma_delete()`
-- `pma_compact()`
-- `graph_insert_directed_edge()`
-- `graph_delete_directed_edge()`
-- `dumpToZone()`
-- `dumpToZoneParallel()`
-- `dumpToZoneZoneSerial()`
-- `garbage_collection_greedy()`
-- `persist_cache_vertices_as_records()`
-- `recover_graph_from_zns_records()`
-
-`benchmark.h`
-
-图计算 benchmark，包括 PageRank、BFS、CC 等。读取邻接时已按 `blk_list.empty()` 判断 cache/PMA 路径，避免小度但已迁移 PMA 的顶点被错误当成 cache-only 顶点。
-
-`Makefile`
-
-构建 `main_pma_check_new`。
-
-## 3. 邻居存储和更新逻辑
-
-每个顶点的邻居有两种状态。
-
-### 3.1 cache_buf
-
-当顶点度数小于 `CACHE_BLK_SIZE` 时，邻居直接放在：
-
-```cpp
-Vertex::cache_buf[CACHE_BLK_SIZE]
-```
-
-当前 demo 阈值为：
-
-```cpp
-#define CACHE_BLK_SIZE 16
-```
-
-这是 `cache_buf` 的数组上限。运行时可以用参数调整实际缓存阈值：
-
-```bash
---cache-threshold <0..16>
---no-cache
-```
-
-`--no-cache` 等价于 `--cache-threshold 0`，顶点第一次插入就迁入 PMA 路径，适合作为无小度缓存的恢复/写放大对比实验。默认阈值为 16。恢复实验中，保守 redo 回放可以补齐 cache-only 顶点；如果关闭 cache，则 `committed_op_id` 的全图高水位语义更容易成立。
-
-### 3.2 PMA block
-
-当 `cache_buf` 满后，已有 cache 邻居整体迁移到 PMA：
-
-```cpp
-Vertex::blk_list
-Vertex::pma
-```
-
-PMA 逻辑上仍以 `PM_BLK_SIZE=64` 个 `int32_t` 为一个块。空位用 `-1` 表示。
-
-每个 `pm_blk` 额外维护一组内存态 block meta：
-
-```cpp
-int32_t min_val;
-int32_t max_val;
-int32_t valid_count;
-bool sorted;
+0
+8
+16
 ```
 
 含义：
 
-```text
-min_val / max_val:
-  当前 block 内有效邻居值范围。当前已维护，后续可用于 block-level 查询剪枝。
+- `0`：关闭低度顶点 cache；
+- `8`：较小低度 cache；
+- `16`：默认设计。
 
-valid_count:
-  当前 block 内非 -1 slot 数。为 0 时查询可以直接跳过整个 block。
+该实验用于验证低度顶点 DRAM cache 的必要性。
 
-sorted:
-  当前 block 内有效元素按 slot 顺序非降序。未经过 append-only merge 直接填空洞的 block 可用块内二分查找；被 merge 直接填入过的 block 标记为无序，查询时退化为块内线性扫描。
-```
+### 3.4 Graph Maintenance 并行度消融
 
-这些 meta 不持久化到 ZNS，也不进入 `ZNSBlockHeader`。它们是由 block payload 派生出的内存索引，恢复时会重新读取 block 内容并重建。
-
-插入流程：
+变量：
 
 ```text
-graph_insert_directed_edge()
-  -> cache_buf 未满：cache_insert_unique()
-  -> cache_buf 满：把 cache 邻居和新边排序后迁入 PMA
-  -> PMA 顶点：按目标 pma_blk_idx 追加到 pending_insert_by_block，无法稳定定位时进入 pending_insert_unplaced，后续批量 merge 到 PMA block
+1
+4
+8
+64
 ```
 
-删除流程：
+机器最大逻辑线程数为 8。`64` 用于保持与主实验参数一致，并观察过量线程下的表现。
+
+### 3.5 GC 策略实验
+
+比较：
+
+- Basic；
+- Greedy；
+- ATZ-GC。
+
+指标：
+
+- update total time；
+- GC count；
+- GC total time；
+- moved live blocks；
+- write amplification。
+
+Skitter 是最干净的 update 阶段 GC 对比；Pokec 和 LiveJournal 可作为大图补充。
+
+### 3.6 Recovery 实验
+
+Recovery 实验只需要报告：
+
+- recovery total time；
+- validation time/result；
+- recovery vs load。
+
+该实验不需要运行 graph query。
+
+### 3.7 删除效率实验
+
+删除 workload：
+
+- 每个数据集固定 `1,000,000` 条无向边；
+- 每条无向边执行两个方向删除；
+- 即 `2,000,000` 次 directed delete attempts。
+
+对比说明：
+
+- ZoneGraph：在线逻辑删除，并发执行；
+- LiveGraph：事务删除；
+- LSMGraph：tombstone-style 删除；
+- MBFGraph：文件级 marker deletion，应单独标注。
+
+## 4. 实验约定
+
+### Directed / Undirected
+
+主实验默认将输入边视为无向边：
 
 ```text
-graph_delete_directed_edge()
-  -> cache-only：cache_delete()
-  -> PMA：pma_delete()
-  -> 可选 --compact-delete：pma_compact()
+1 input edge -> 2 directed edges
 ```
 
-删除边后，如果 dirty block 数达到 `cache_blk_threshold`，由 main 根据当前模式刷回 ZNS。
-
-### 3.3 PMA 查询与 block meta
-
-PMA 查询入口仍是：
-
-```cpp
-binary_pma_find()
-binary_pma_find_recovery()
-```
-
-当前查询优化集中在 block-level meta：
+删除实验同样遵循：
 
 ```text
-1. 如果 block.valid_count == 0，直接跳过整个 block。
-2. 使用 min_val / max_val 判断目标边是否可能落在该 block。
-3. 如果 block.sorted == true，在 block 内对有效元素做有序查找。
-4. 如果 block.sorted == false，说明该 block 被 append-only merge 直接填过空洞，查询时块内线性扫描。
+1 undirected delete -> 2 directed delete attempts
 ```
 
-当前实际用于查询和 merge 的是 `valid_count`、`min_val / max_val` 和 `sorted`。
+### Final Dump
 
-block meta 的刷新策略是“从 block 内容重算”，而不是在每次元素移动时逐 slot 增量维护。主要刷新时机：
+ZoneGraph 查询结果区分：
 
-```text
-cacheBlock():
-  从 ZNS 读入 block 后刷新。
+- before final dump；
+- after final dump。
 
-pma_insert() / pma_delete():
-  PMA 内容变化后刷新受影响或已加载 block。
+before final dump 可能仍有低度顶点停留在 DRAM；after final dump 更接近完整持久化后的查询路径。
 
-spread() / resize() / pma_compact():
-  PMA 重排或扩容后刷新受影响 block。
+### GC 实验边界
 
-dumpToZone() / dumpToZoneZoneSerial():
-  写回 ZNS 前根据 DRAM buf 刷新；写完后 buf 释放，但 meta 保留。
+普通 baseline maintenance/query 实验不是 GC 压力实验。GC 效果应使用专门的 skew update workload 说明。
 
-garbage_collection_greedy() / basic-gc / ATZ-GC:
-  搬迁有效 block 时根据读出的 payload 刷新。
+### MBFGraph 删除语义
 
-recover_graph_from_zns_records():
-  record 恢复选择 latest DATA record 后，读取 payload 重建 meta。
+MBFGraph 的删除是对二进制边文件写 deletion marker，和 ZoneGraph/LiveGraph/LSMGraph 的在线图结构删除不同。论文中需要单独标注。
 
-graph_recovery():
-  旧路径根据 global_zone_vec 扫描有效块，读取 payload 后重建 meta。
-```
+## 5. 可支撑的主要结论
 
-## 4. 写入 ZNS 的路径
+1. Degree-aware 邻接管理能显著减少低度顶点带来的 ZNS 写入和 dump 开销。
+2. PMA 风格邻接块能在更新效率和查询友好性之间取得平衡。
+3. ZNS record 将随机图更新转化为 append-only 块写。
+4. ATZ-GC 在 skewed update 场景下降低 live block 搬迁量和 GC 时间。
+5. Recovery 可以从 ZNS record 重建 DRAM metadata，不需要重新加载原始图。
+6. ZoneGraph 删除效率高，因为删除先作用于 DRAM/PMA 逻辑结构，物理持久化被延后到块级 dump。
 
-### 4.1 历史路径：payload-only
+## 6. 限制说明
 
-历史对比路径。当前默认不再进入该路径。
+- 当前查询和结构更新不并发执行；查询阶段会获得稳定图视图。
+- Recovery 实验是 restart metadata recovery，不等同于完整掉电一致性验证。
+- MBFGraph 删除结果不应和在线删除系统直接混同。
+- 过大的 cache block threshold 会使系统更接近 DRAM-only，只适合作为上界消融，不适合作为公平主结果。
 
-```text
-writeBlockToZone(fd, payload, PM_BLK_SIZE, wp)
-readBlockFromZone(fd, payload, PM_BLK_SIZE, wp)
-```
-
-`pm_blk.global_wp` 指向 payload 起始地址。`mark_zone()` 用 `ZONE_BLK_SIZE` 语义计算 zone 内 block index。
-
-这个路径仅用于和 record 恢复方案做历史对比。
-
-旧路径是不考虑 recovery 的 baseline：
-
-```text
-不写 ZNSBlockHeader
-不写 COMMIT record
-不写 redo log
-不预留 redo/meta zone
-```
-
-旧 payload-only 路径不会产生 redo log。当前命令行默认不暴露该路径。
-
-### 4.2 默认路径：ZNS record
-
-默认启用。兼容参数：
-
-```bash
---zns-record
-```
-
-record 格式定义在 `global.h`：
-
-```cpp
-struct ZNSBlockHeader {
-    uint32_t magic;
-    uint32_t version;
-    uint32_t record_type;   // DATA 或 COMMIT
-    uint32_t payload_bytes;
-    uint64_t epoch;
-    int32_t src_vid;
-    int32_t pma_blk_idx;
-    uint64_t seq;
-    uint64_t first_seq;     // COMMIT 使用
-    uint64_t last_seq;      // COMMIT 使用
-    uint32_t data_record_count;
-    uint32_t aggregate_checksum;
-    uint32_t valid_count;
-    uint32_t pma_ele;
-    uint32_t pma_cap;
-    uint64_t committed_op_id; // COMMIT 使用
-    uint32_t checksum;
-    uint32_t tail_magic;
-};
-```
-
-写入时：
-
-```text
-beginZNSEpoch()
-writeZNSRecord()
-  -> 生成 DATA header
-  -> 写入当前 epoch
-  -> 计算 checksum
-  -> 拼成 512B record
-  -> pwrite(fd, record, 512, record_wp)
-commitZNSEpoch()
-  -> 向 metadata zone 追加 COMMIT record
-  -> COMMIT 记录 epoch、seq 范围、data record 数、汇总 checksum 和 committed_op_id
-```
-
-读取时：
-
-```text
-readZNSRecordPayload()
-  -> pread 整条 512B record
-  -> 校验 magic/version/checksum
-  -> 拷贝 payload
-```
-
-record 路径下，`pm_blk.global_wp` 指向 record 起始地址，不是 payload 起始地址。
-
-record 路径是 recovery 版本。普通运行默认会启用 DATA/COMMIT record；开启 `--redo-log` 或 `--recovery-test` 时会写 packed redo log 文件，并保留独立 redo log zone 作为回退路径：
-
-```bash
-sudo ./main_pma_check_new 0 1 parallel2
-```
-
-恢复命令 `--recover-zns` 使用 record/recovery 路径，redo replay 期间不会再次追加 redo log。
-
-### 4.3 Epoch Commit 事务边界
-
-record 模式下，一个 `dumpToZone*()` 或 `persist_cache_vertices_as_records()` 会被当成一个 epoch：
-
-```text
-beginZNSEpoch()
-  DATA epoch=N src=a blk=x
-  DATA epoch=N src=b blk=y
-  DATA epoch=N src=c blk=z
-commitZNSEpoch()
-  COMMIT epoch=N
-```
-
-DATA record 表示“某个顶点 PMA block 的一个版本”。COMMIT record 不属于任何顶点，只表示该 epoch 的 DATA record 已完整写入并可参与恢复。
-
-COMMIT record 写入最后一个 metadata zone，包含：
-
-```text
-epoch
-first_seq / last_seq
-data_record_count
-aggregate_checksum
-committed_op_id
-```
-
-`aggregate_checksum` 是顺序无关的，可以覆盖 DATA record 跨 zone 分布时物理扫描顺序和 seq 顺序不一致的情况。当前 `dumpToZoneParallel()` 为保证 ZNS zone 内顺序写，已收敛到 zone-serial writer；插入阶段仍可并行，物理写入阶段按 zone 顺序提交。
-
-恢复时只有通过以下条件的 epoch 才会生效：
-
-```text
-存在合法 COMMIT record
-DATA record 数量等于 data_record_count
-DATA seq 范围等于 first_seq / last_seq
-DATA checksum 汇总等于 aggregate_checksum
-```
-
-如果 COMMIT record 不存在，或者 COMMIT / DATA 任一部分不完整导致校验不匹配，该 epoch 会被整体忽略。
-
-## 5. Zone-Class 策略
-
-启用参数：
-
-```bash
---zone-class
-```
-
-顶点分类：
-
-```cpp
-VERTEX_COLD
-VERTEX_HOT
-VERTEX_HUB
-```
-
-分类函数：
-
-```cpp
-classify_vertex(Vertex *v)
-```
-
-当前规则：
-
-- `hub`：`degree >= hub_degree_threshold` 或 `blk_list.size() >= hub_block_threshold`
-- `hot`：`update_count >= hot_update_threshold`
-- 其他为 `cold`
-
-zone 划分在 `generate_block_opt()` 中完成：
-
-- 前一部分 zone：hot
-- 中间 zone：cold
-- 最后一部分 zone：hub
-
-刷盘时通过 `requestClassifiedBlock()` 优先从对应 class zone 分配 block。对应 class 空间不足时会 fallback 到其他 class zone，以保证实验能继续跑。
-
-## 6. GC 策略
-
-当前 `parallel2` 实验路径支持三种 single-victim GC。每次 GC 只选择 1 个 victim zone，搬迁该 zone 内仍然 live 的 block，然后 reset victim zone。
-
-### 6.1 Basic GC
-
-`--basic-gc` 是最朴素 baseline：
-
-```text
-按 zone id 顺序扫描 data zones
-找到第一个存在 invalid block 的 zone
-不看 invalid ratio
-不看 live block 数
-不看冷热分类
-```
-
-该策略用于表示 naive ZNS reclaim。它通常会搬迁更多 live block，因此适合作为最基础对照组。
-
-### 6.2 Greedy GC
-
-默认策略是不带 `--basic-gc` 和 `--atz-gc` 的 greedy GC。它在候选 zones 中选择 invalid block 数最多的 victim zone：
-
-```text
-victim = argmax_z invalid_blocks(z)
-```
-
-它比 basic 更强，能避免明显低效的 victim，但仍然不理解顶点更新冷热。
-
-### 6.3 ATZ-GC
-
-`--atz-gc` 启用 Asymmetric Temperature-aware Zone GC。核心目标不是主动迁移所有热数据，而是在必要写入和必要 GC relocation 时根据顶点温度做放置，并保护 cold zones。
-
-顶点温度：
-
-```text
-recent_updates[v]++  // 顶点发生插入/删除/PMA rewrite
-temperature[v] = alpha * recent_updates[v] + (1 - alpha) * temperature[v]
-
-temperature >= hot_threshold  -> HOT
-temperature <= cold_threshold -> COLD
-otherwise                     -> WARM
-```
-
-zone 类型：
-
-```text
-ZONE_MIXED: 初始阶段或未知冷热
-ZONE_HOT:   hot vertex block 优先写入
-ZONE_WARM:  warm vertex block 优先写入
-ZONE_COLD:  cold vertex block 优先写入，并默认被 GC 保护
-ZONE_FREE:  reset 后的空 zone
-```
-
-ATZ victim score：
-
-```text
-score(z) = invalid_blocks(z) /
-           (hot_live_blocks(z) + warm_live_blocks(z)
-            + beta * cold_live_blocks(z) + 1)
-```
-
-`beta > 1` 用于惩罚包含大量 cold live block 的 zone。普通 GC 默认跳过 cold zone；只有 emergency 或 cold zone invalid ratio 足够高时才允许回收 cold zone。
-
-ATZ-GC 的非对称性：
-
-```text
-cold data:
-  GC relocation 时主动沉淀到 cold zone。
-
-hot data:
-  不因为顶点变 hot 就主动从 cold zone 迁出。
-  只有该 block 被更新，或其所在 zone 已经被选为 victim 时，才写入 hot/warm zone。
-```
-
-因此 classification only guides placement，不触发主动 relocation。
-
-关键点：搬迁后必须更新：
-
-```cpp
-v->blk_list[blkIndex].global_wp
-mark_zone(src, blkIndex, new_wp)
-```
-
-### 6.4 GC 并发与 record commit
-
-GC 与查询/更新的并发边界：
-
-```text
-1. GC 先持有 global_gc_mutex，保证同一时刻只有一个 GC。
-2. GC 会锁住 victim zone 的分配队列，防止其他刷盘线程在 GC 期间继续向 victim zone 分配新 block。
-3. 搬迁某个有效 block 前，GC 尝试获取该 block 所属顶点的 unique_lock。
-4. 如果顶点正被查询、更新或刷盘占用，GC 放弃本轮 victim，不 reset zone。
-5. 只有成功拿到顶点锁后，GC 才会更新 v->blk_list[blk_idx].global_wp 和 zone metadata。
-```
-
-record 模式下，GC 搬迁也有 epoch 边界：
-
-```text
-beginZNSEpoch()
-  写搬迁后的 DATA record
-commitZNSEpoch()
-  COMMIT 成功后才 reset victim zone
-```
-
-如果 GC 中途因为 busy vertex 或分配失败放弃，会先提交已经成功搬迁的 DATA records，再返回失败；victim zone 不会 reset。因此恢复时不会出现“旧 zone 已 reset、新 DATA record 未 COMMIT 而被忽略”的丢块窗口。
-
-## 7. ZNS-Native Restart Recovery
-
-当前恢复模型是 restart recovery / DRAM metadata recovery：
-
-```text
-假设:
-  重启前已经成功写入的 ZNS DATA/COMMIT/redo records 在设备上可读。
-
-恢复目标:
-  1. 重建 DRAM 中丢失的 Vertex / PMA / blk_list / zone metadata。
-  2. 从 block payload 重建 valid_count / min_val / max_val / sorted。
-  3. 通过 redo log 文件回放未进入 ZNS checkpoint 的 cache-only 小度顶点更新。
-  4. 统计 metadata/data/redo 扫描和图结构重建时间。
-  5. 抽样顶点验证恢复前后邻接集合一致性。
-
-不验证:
-  1. pwrite 返回后真实掉电是否已持久化。
-  2. flush/FUA/PLP/控制器缓存语义。
-  3. 任意突然断电时刻的 power-fail atomicity。
-```
-
-因此，本文实验重点是重启后的扫描和 DRAM 状态重建成本，而不是设备级掉电一致性。
-
-写入 record：
-
-```bash
-sudo ./main_pma_check_new 0 1 parallel2 --print-pma
-```
-
-从 ZNS record 恢复：
-
-```bash
-sudo ./main_pma_check_new 0 1 --recover-zns --print-pma
-```
-
-`--recover-zns` 使用默认 record 模式，并且不会执行：
-
-```cpp
-zbd_reset_zones()
-```
-
-恢复逻辑：
-
-```text
-recover_graph_from_zns_records()
-  -> 扫描 metadata zone，找合法 COMMIT record
-  -> 扫描 data zone 到当前 write pointer，统计已提交 epoch 的 DATA record
-  -> 校验 data_record_count / aggregate_checksum / seq 范围
-  -> 只使用通过校验的 epoch
-  -> 得到最新 committed_op_id 高水位（当前仅用于统计和后续优化）
-  -> key = (src_vid, pma_blk_idx)
-  -> 同一 key 保留已提交 epoch 中最新的版本
-  -> 重建 global_vectex_vec
-  -> 重建 v->blk_list[blk_idx].global_wp
-  -> 重建 degree / pma_ele / pma_cap
-  -> mark_zone()
-  -> 优先读取 redo log 文件 redo.log
-  -> 如果 redo.log 不存在，再回退扫描 redo log zone
-  -> 保守顺序回放全量 redo log，重建未进入 ZNS 快照的 DRAM-only 小度顶点更新
-```
-
-`--recovery-test` 是当前推荐的恢复实验入口：
-
-```text
-graph_maintenance_parallel2()
-  -> 可选 --final-dump，把 DRAM dirty PMA blocks 写成 ZNS DATA records
-  -> flush redo log
-  -> 抽样保存恢复前顶点邻接集合
-  -> clear_dram_graph_metadata_for_recovery()
-  -> recover_graph_from_zns_records()
-  -> validate_recovery_sample()
-  -> 打印 graph maintenance 时间、恢复时间和 validation 结果
-```
-
-抽样验证默认检查 128 个有边顶点，其中一部分来自高 degree 顶点，一部分按顶点分布间隔抽取。验证项包括顶点是否存在、邻接集合是否完全一致、missing edge 数和 extra edge 数。
-
-恢复完成后会输出两类统计。第一行是概要：
-
-```text
-ZNS-native recovery records: <latest_records>
-  committed_epochs: <committed_epochs>
-  valid_epochs: <valid_epochs>
-  committed_op_id: <committed_op_id>
-  redo_records: <redo_records>
-  max_vid: <max_vid>
-  time: <seconds>
-```
-
-第二行是可用于实验分析的详细指标：
-
-```text
-ZNS recovery stats:
-  meta_slots_scanned=<n>
-  commit_records_valid=<n>
-  committed_epochs=<n>
-  valid_epochs=<n>
-  data_slots_scanned=<n>
-  data_records_valid=<n>
-  data_records_committed_epoch=<n>
-  latest_records=<n>
-  redo_slots_scanned=<n>
-  redo_file_used=<0|1>
-  redo_records_valid=<n>
-  redo_records_replayed=<n>
-  rebuilt_vertices=<n>
-  rebuilt_blocks=<n>
-  rebuilt_edges_before_redo=<n>
-  committed_op_id=<n>
-  max_seq=<n>
-  max_epoch=<n>
-  max_op_id=<n>
-  recovery_time_sec=<seconds>
-```
-
-各项含义：
-
-```text
-meta_slots_scanned:
-  扫描 metadata zone 的 record slot 数，反映 metadata zone 扫描成本。
-
-commit_records_valid:
-  checksum/header 合法且类型为 COMMIT 的 record 数。
-
-committed_epochs:
-  metadata zone 中出现过的 epoch 数；同一 epoch 多条 COMMIT 时保留 seq 最大的一条。
-
-valid_epochs:
-  通过 COMMIT 校验的 epoch 数。只有这些 epoch 的 DATA record 会参与恢复。
-
-data_slots_scanned:
-  扫描 data zones 的 record slot 数。`--recovery-test` 中该值受当前 write pointer 限制；真正重启恢复若没有 checkpoint summary，仍可能接近全 zone 扫描。
-
-data_records_valid:
-  header/checksum 合法且类型为 DATA 的 record 数。
-
-data_records_committed_epoch:
-  属于已出现 COMMIT epoch 的 DATA record 数。之后还会用数量、seq 范围和 aggregate checksum 过滤出 valid epoch。
-
-latest_records:
-  按 (src_vid, pma_blk_idx) 去重后保留下来的最新 DATA record 数，也就是恢复快照中的有效块版本数。
-
-redo_slots_scanned:
-  扫描 redo log zone 的 record slot 数。redo_file_used=1 时通常为 0。
-
-redo_file_used:
-  是否从普通文件 redo.log 读取 redo records。当前 recovery 实验优先使用 redo 文件。
-
-redo_records_valid:
-  header/checksum 合法的 redo log record 数。
-
-redo_records_replayed:
-  实际回放的 redo log 数。当前为保守全量回放，主要用于补齐 cache-only 小度顶点更新。
-
-rebuilt_vertices:
-  恢复过程中重建的 Vertex 数。
-
-rebuilt_blocks:
-  从 latest_records 恢复出的 PMA/cache record 块数。
-
-rebuilt_edges_before_redo:
-  redo 回放前，仅由 ZNS DATA record 恢复出的邻边数量。
-
-committed_op_id:
-  COMMIT record 中记录的最大更新高水位。当前主要用于统计和后续 checkpoint 优化。
-
-max_seq:
-  扫描到的最大 ZNS DATA/COMMIT record 序号。
-
-max_epoch:
-  扫描到的最大 epoch。
-
-max_op_id:
-  扫描到的最大 redo log op_id。
-
-recovery_time_sec:
-  recover_graph_from_zns_records() 的总耗时。
-```
-
-restart recovery 语义：
-
-- 新版本写完整后，即使旧版本仍然在盘上，恢复时也会选择 `seq` 最大的 record。
-- DATA record 写入过程中出现 partial/corrupt record 时，checksum/tail magic 不匹配的 record 会被恢复扫描忽略。
-- 一个 epoch 的 COMMIT record 不存在时，该 epoch 的 DATA record 整批不会参与恢复。
-- COMMIT record 存在时，恢复会用 COMMIT 中的数量、seq 范围和汇总 checksum 验证该 epoch 是否完整。
-- redo log 同时支持独立预留 zone 和普通文件 `redo.log`；当前恢复实验优先使用 redo 文件，并采用保守全量回放策略。
-- 由于小度顶点可能长期只存在 DRAM cache，只有在 checkpoint 明确持久化 cache-only 顶点后，`committed_op_id` 才能作为跳过 redo log 的安全高水位；当前实现采用保守策略，按顺序回放 redo log，利用 INSERT/DELETE 的幂等性保证正确性。
-- 当前实现已有 metadata zone 的 epoch commit，但还没有 checkpoint summary。`--recovery-test` 在同进程内使用当前 write pointer 限制扫描范围；真正重启后的 `--recover-zns` 仍需要更完整的 checkpoint summary 才能避免全 zone 扫描。
-- `ZNS_BLOCK_VERSION` 当前为 3；旧版 record 不会被新版 `--recover-zns` 识别。
-
-## 8. 并发查询与更新
-
-当前并发模型是 single-query / multi-update：
-
-```text
-更新阶段:
-  多个更新任务可以并发执行。
-  不同顶点更新可并发；同一顶点由 Vertex::mutex 串行化。
-
-查询阶段:
-  同一时刻只运行一个图查询任务。
-  PageRank/BFS/CC 查询会独占全局图锁。
-  查询开始前会等待正在进行的更新、刷盘、GC 完成。
-  查询期间新的更新、刷盘、GC 会阻塞。
-  查询看到的是获得全局独占锁之后的稳定图。
-```
-
-全局互斥通过：
-
-```cpp
-global_query_update_mutex
-```
-
-实现。边插入/删除、刷盘和 GC 属于更新类任务，持有 shared lock；PageRank、BFS、CC 属于查询任务，持有 unique lock。由于更新任务使用 shared lock，多个更新仍可并发；由于查询使用 unique lock，查询期间图结构不会变化。
-
-查询路径同时从“会污染更新缓存的读路径”中拆出来。`benchmark.h` 中的 PageRank、BFS、CC 现在通过：
-
-```cpp
-for_each_neighbor_readonly(Vertex *v, Fn &&fn)
-```
-
-统一遍历邻接。这个 helper 的规则是：
-
-```text
-1. 对当前顶点持有 shared lock，防止同一顶点的边更新或刷盘同时改 degree/cache_buf/blk_list/buf/global_wp。
-2. 如果顶点仍是小度 cache-only 状态，只读该顶点版本中的 degree 和 cache_buf。
-3. 如果顶点已经迁入 PMA，遍历 blk_list。
-4. 对已经在 DRAM 的 block，直接只读 buf。
-5. 对只在 ZNS 上的 block，读到查询私有临时 buffer，处理完立即复用/释放。
-6. 查询路径不调用 cacheBlock()，因此不会 invalid 旧 ZNS block，不会增加 global_cache_blk，也不会触发 dumpToZone()。
-```
-
-对应地，边插入/删除仍使用 `Vertex::mutex` 的 `unique_lock`。无向边手动插入路径使用 `graph_insert_undirected_edge()`，在同一个全局 shared lock 内执行两个方向的 directed update；查询不会在两个方向之间插入。`dumpToZone()`、`dumpToZoneZoneSerial()` 和 `persist_cache_vertices_as_records()` 在释放 `buf`、更新 `global_wp` 或把 cache-only 顶点持久化为 record 前，也会持有该顶点的 `unique_lock`。GC 搬迁有效 block 时会先持有 `global_gc_mutex` 串行化 GC，再对被搬迁 block 所属顶点尝试获取 `unique_lock`；如果顶点正被更新或刷盘占用，本轮 GC 会放弃当前 victim，不 reset zone。这样避免 GC 与更新同时改同一顶点的 `blk_list/global_wp`，也避免自锁。
-
-因此当前实现保证的是：
-
-```text
-单个顶点读取期间的内存安全和结构一致性：
-  查询不会读到同一顶点被更新/刷盘改到一半的 degree/cache_buf/blk_list/buf/global_wp。
-
-单查询稳定图:
-  查询持有全局 unique lock，执行期间不会有更新、刷盘、GC 改图。
-
-查询读 ZNS block 不产生写放大：
-  查询从 ZNS 读入的 block 是临时只读 buffer，用完即丢，不进入 dirty cache。
-
-GC 与查询/更新的顶点级互斥：
-  GC 只有拿到目标顶点 unique_lock 后才会搬迁该顶点 block 并更新 global_wp。
-```
-
-当前实现不是 MVCC：查询期间更新会暂停，而不是让查询读历史版本、更新继续写新版本。如果未来希望查询和更新真正同时进行，并且查询仍看到固定全图 snapshot，需要继续引入：
-
-```text
-global_graph_epoch:
-  查询开始时记录 snapshot_epoch。
-
-VertexVersion:
-  版本化 degree/cache_buf/PMA 元数据/blk_list，用于覆盖低度顶点和 cache -> PMA 迁移。
-
-BlockVersion:
-  版本化 PMA block 的 buf/global_wp/meta，被更新 block 走 copy-on-write。
-
-active query epochs:
-  旧 VertexVersion、BlockVersion 和旧 ZNS physical block 延迟回收。
-```
-
-MVCC 版本下各种场景的目标语义如下：
-
-```text
-低度顶点更新:
-  复制 VertexVersion，旧查询读旧 cache_buf，新查询读新 cache_buf。
-
-低度顶点迁移 PMA:
-  旧 VertexVersion 保持 cache-only，新 VertexVersion 指向 PMA block。
-
-DRAM cached block 更新:
-  复制旧 buf，在新 buf 上修改，旧 buf 保留给旧查询。
-
-ZNS-only block 更新:
-  从旧 global_wp 读 payload，生成新 BlockVersion，旧 global_wp 延迟 invalid/GC。
-
-PMA spread/resize/compact:
-  所有被写入的 block 都生成新 BlockVersion，未改 block 共享旧版本。
-
-无向边更新:
-  u->v 和 v->u 应使用同一个 commit_epoch 原子发布，避免查询看到半条无向边。
-```
-
-因此，当前实现选择的是更简单的“查询独占、更新并发”模型，不需要保留历史版本；如果实验需要查询和更新重叠执行，再按上面的 `VertexVersion + BlockVersion + epoch` 方案实现 MVCC。
-
-## 9. 命令行参数
-
-基本格式：
-
-```bash
-sudo ./main_pma_check_new <dataset_id> <thread_num> [mode] [options]
-```
-
-构图模式：
-
-```text
-baseline
-new
-parallel
-parallel2
-```
-
-常用参数：
-
-```text
---print-pma
---insert <src> <dst>
---delete <src> <dst>
---compact-delete
---no-cache
---cache-threshold <n>
---cache-block-threshold <n>
---pending-merge-threshold <n>
---zone-writer
---zone-class
---basic-gc
---atz-gc
---max-data-zones <n>
---gc-proactive-free-blocks <n>
---zns-record  # 默认已启用，保留用于旧脚本兼容
---redo-log
---recovery-test
---recover-zns
---final-dump
---print-dram-metadata
-```
-
-设备路径固定在：
-
-```cpp
-#define NVME_DEVICE_PATH "/dev/nvme0n1"
-```
-
-## 10. 常用验证命令
-
-编译：
-
-```bash
-make
-g++ -O2 -g -std=c++17 -Wall -Wextra -fopenmp gc_skew_experiment.cpp -lzbd -o gc_skew_experiment
-```
-
-### 10.1 Graph maintenance 性能
-
-```bash
-# YouTube，64 线程 parallel2，较大 buffer，通常不触发 GC
-sudo ./main_pma_check_new 17 64 parallel2 \
-  --cache-block-threshold 200000 \
-  --pending-merge-threshold 4000000
-
-# Skitter，64 线程 parallel2，可用于更大图构图测试
-sudo ./main_pma_check_new 19 64 parallel2 \
-  --cache-block-threshold 200000 \
-  --pending-merge-threshold 4000000
-```
-
-输出重点：
-
-```text
-Load graph total time
-Load graph dump count
-Load graph dump total time
-Load graph GC count
-Load graph GC total time
-Load graph GC moved blocks
-Load graph on NVM new time
-```
-
-### 10.2 GC 三方案对比
-
-GC 对比建议使用独立 skew update 实验程序。该程序先 load 原图，再选高 degree 顶点做 synthetic hot updates，更容易体现冷热感知 GC 的作用。
-
-```bash
-# Basic GC: first-invalid victim
-sudo ./gc_skew_experiment 19 64 2048 512 \
-  --basic-gc \
-  --max-data-zones 8 \
-  --cache-block-threshold 5000 \
-  --pending-merge-threshold 500000 \
-  --gc-proactive-free-blocks 16000000
-
-# Greedy GC: invalid blocks 最多的 victim
-sudo ./gc_skew_experiment 19 64 2048 512 \
-  --max-data-zones 8 \
-  --cache-block-threshold 5000 \
-  --pending-merge-threshold 500000 \
-  --gc-proactive-free-blocks 16000000
-
-# ATZ-GC: temperature-aware placement + cold-zone protection
-sudo ./gc_skew_experiment 19 64 2048 512 \
-  --atz-gc \
-  --max-data-zones 8 \
-  --cache-block-threshold 5000 \
-  --pending-merge-threshold 500000 \
-  --gc-proactive-free-blocks 16000000
-```
-
-输出重点：
-
-```text
-Skew update total time
-Skew update dump count
-Skew update dump total time
-Skew update GC count
-Skew update GC total time
-Skew update GC moved blocks
-Skew update foreground time
-ATZ GC cold skipped/protected
-ATZ migrated hot/warm/cold blocks
-```
-
-已验证的一组 Skitter 结果：
-
-```text
-Basic:  GC count=6, GC time=72.6456s, moved=1,250,927, total=78.7435s
-Greedy: GC count=4, GC time=43.7693s, moved=746,205,   total=49.0294s
-ATZ:    GC count=2, GC time=33.0823s, moved=561,393,   total=37.3132s
-```
-
-### 10.3 Recovery 时间和正确性验证
-
-当前推荐用 `--recovery-test`，它会在 `graph_maintenance_parallel2()` 结束后清理 DRAM metadata，再从 ZNS DATA records 和 `redo.log` 恢复，并抽样验证恢复正确性。
-
-```bash
-# 只验证 redo 文件恢复；大 buffer 下可能不会产生 ZNS DATA records
-sudo ./main_pma_check_new 17 64 parallel2 \
-  --recovery-test \
-  --cache-block-threshold 1000000 \
-  --pending-merge-threshold 4000000
-
-# 验证 ZNS DATA records + redo 文件组合恢复
-sudo ./main_pma_check_new 17 64 parallel2 \
-  --recovery-test \
-  --final-dump \
-  --cache-block-threshold 50000 \
-  --pending-merge-threshold 4000000
-```
-
-输出重点：
-
-```text
-ZNS-native recovery records
-ZNS recovery stats
-redo_file_used
-redo_records_replayed
-Recovery sample validation
-Recovery experiment time
-recovery_vs_load
-validation=PASS
-```
-
-已验证的一组 YouTube 结果：
-
-```text
-Load graph total time: 30.0288
-Dump to zone-serial writer time: 1.10904  # --final-dump，发生在 graph maintenance 之后
-ZNS-native recovery records: 135621
-redo_records: 5975248
-redo_file_used=1
-Recovery sample validation: checked_vertices=128 checked_edges=264964 result=PASS
-Recovery experiment time: zns_and_redo=4.36842 recovery_vs_load=0.145474 validation=PASS
-```
-
-## 11. 当前创新点
-
-### 11.1 ZNS-aware PMA Block Mapping
-
-系统将 ZNS zone 切分为固定大小的可写 block/record，并把每个顶点的 PMA 邻接表映射到一组 ZNS block 上。每个 PMA block 通过 `pm_blk.global_wp` 指向当前最新物理版本；record 模式下还通过 `src_vid` 和 `pma_blk_idx` 将该映射持久化。这样 PMA 插入、删除和重平衡产生的局部随机更新可以转化为 ZNS 友好的 append-only block rewrite，同时为恢复和 GC 提供明确的逻辑-物理映射。
-
-### 11.2 小度顶点 DRAM cache + PMA 延迟刷盘
-
-小度顶点不立即占用 ZNS block，减少小邻接表写放大。超过阈值后再迁移到 PMA。
-
-### 11.3 PMA Block Meta 查询加速
-
-每个 `pm_blk` 维护内存态 `valid_count`、`min_val`、`max_val` 和 `sorted`。查询时可以跳过空 block，并用 min/max 过滤候选 block；块内仍保持有序时走二分，被 append-only merge 直接填空洞后则标记为无序并线性扫描。meta 不持久化，恢复时从 block payload 重建，因此 payload-only 和 ZNS record 两条路径都能使用同一套查询辅助信息。
-
-### 11.4 删除边延迟写回
-
-删除边先在 cache/PMA DRAM block 中修改。达到 `global_cache_blk >= cache_blk_threshold` 后再刷回 ZNS，避免每个删除都立即读写 ZNS。
-
-### 11.5 Vertex-Class / Temperature-Class Placement
-
-旧的 vertex-class 路径按 hot/cold/hub 做初步 zone 分区。当前更重要的是 ATZ-GC 中的 temperature-aware placement：初始写入可以进入 mixed zone，运行中通过顶点更新频率估计 hot/warm/cold，之后只在正常 block rewrite 或 GC relocation 发生时选择目标 zone。分类本身不触发迁移。
-
-### 11.6 Basic / Greedy / ATZ-GC 对比
-
-当前 GC 实验提供三种 victim selection：
-
-- Basic：第一个有 invalid block 的 zone，作为 naive baseline。
-- Greedy：invalid block 数最多的 zone，作为较强 baseline。
-- ATZ-GC：使用 invalid/live-temperature score，同时保护 cold zone。
-
-ATZ-GC 的创新点是非对称冷热处理：cold data 在必要 relocation 中逐步沉淀到 cold zones；hot data 不主动从 cold zones 迁出，而是等后续更新自然写入 hot/warm zones。这样可以降低 skewed update 场景下 cold live block 被反复搬迁的概率。
-
-### 11.7 ZNS-native record restart recovery
-
-每条 DATA record 自描述，恢复不依赖运行时 `global_zone_vec`。record 模式下最后一个 zone 作为 metadata zone，批量写入完成后追加 COMMIT record。重启恢复只使用通过 COMMIT 校验的 epoch，再通过 `epoch/seq` 选择最新版本，用于重建 DRAM metadata 和最新 block 映射。
-
-### 11.8 redo log 文件 + 独立 redo log zone + 保守回放
-
-record 模式下预留独立 redo log zone，同时 `--redo-log` / `--recovery-test` 会把 packed `EdgeLogEntry` 顺序写入普通文件 `redo.log`。恢复实验优先读取 redo 文件，避免为了恢复时间实验扫描整个 redo zone。重启恢复时先恢复已提交的 ZNS 块级快照，再按 `op_id` 顺序保守回放 redo log。该设计覆盖 cache-only 小度顶点未写入 ZNS DATA record 的情况。
-
-### 11.9 Recovery sampling validation
-
-`--recovery-test` 在清理 DRAM 前抽取 128 个有边顶点，保存恢复前邻接集合；恢复后重新收集这些顶点的邻接集合并比较 missing/extra edges。该验证不替代全图校验，但能低成本确认恢复出的 DRAM metadata 和边集合在代表性顶点上保持一致。
-
-## 12. 当前限制和注意事项
-
-1. `--recovery-test` 在同进程内使用当前 write pointer 限制扫描范围；真正重启后的 `--recover-zns` 仍缺少 checkpoint summary，盘大时会慢。
-2. `ZNS_RECORD_SIZE` 当前固定为 512B，payload 仍是 64 个 `int32_t`，剩余空间用于 header 和 padding。
-3. record 恢复目前重建的是 block 指针、degree 和 PMA 元数据，不会重新加载原 dataset；增量更新依赖 redo log 文件或 redo log zone。
-4. 旧路径和 record 路径的 `global_wp` 语义不同，新增代码必须通过 `zns_alloc_unit_size()` 和 record-aware 函数处理，不要手写 `ZONE_BLK_SIZE`。
-5. `--recover-zns` 不 reset zone；普通构图命令会 reset `/dev/nvme0n1`。
-6. 当前 redo 恢复为了覆盖 cache-only 顶点采用全量回放；如果后续实现完整 cache checkpoint，可改为只回放 `op_id > committed_op_id`。
-7. GC 搬迁时需要始终更新顶点 `blk_list` 和 zone metadata，否则恢复和后续查询都会读到旧位置。
-8. record header 当前是 version 3，升级前写入的旧版 record 需要旧程序恢复，或后续补兼容读取逻辑。
-9. `pm_blk` 的 block meta 是内存态派生索引，不持久化。新增会改变 block payload 的路径时，需要调用 `refresh_pm_blk_meta()` 或确保恢复/读入时重建。
-10. 当前并发查询实现采用 single-query / multi-update：查询持有全局独占锁，因此查询期间更新会暂停；如果需要查询和更新重叠执行且查询读取固定 snapshot，应继续实现 `VertexVersion + BlockVersion + global_graph_epoch`。
-11. GC 若遇到 busy vertex 会放弃当前 victim，不 reset zone；这保证并发安全，但可能导致本次空间回收失败，调用方需要有重试或错误处理。
-12. record 模式下 GC 搬迁已经在 reset 前提交 DATA epoch，但还没有实现 MVCC 旧版本延迟 reset；如果未来引入全图 snapshot 查询，需要把 reset 延迟到没有活跃查询引用旧 epoch 之后。
-13. 当前 recovery 实验目标是 restart recovery 时间、DRAM metadata/cache-only 数据重建和抽样正确性验证，不验证真实突然断电下 `pwrite`、flush/FUA、PLP 或控制器缓存的持久化顺序。
-
-## 13. 下次继续开发建议
-
-下一步可以优先做：
-
-1. 给 `--recover-zns` 增加更详细的统计输出：扫描 record 数、无效 header 数、checksum fail 数、每个 zone live record 数。
-2. 增加 `ZoneSummary`，避免每次恢复扫描全部 data zone。
-3. 增加 corrupt/partial record 模拟开关，例如写 header 后退出、写 payload 后退出，验证 checksum 和 seq 选择逻辑。
-4. 对 record 模式下 GC 后恢复做专项验证，确认搬迁后的 `seq` 和 `global_wp` 正确。
-5. 把 hot/cold/hub 阈值做成命令行参数，方便实验扫描。
-6. 将 `min_val / max_val` 接入 block-level 查询剪枝，先在 block meta 上定位候选 block，再读取 payload。
-7. 实现完整并发快照：`global_graph_epoch`、`VertexVersion`、`BlockVersion`、活跃查询 epoch 表、旧 ZNS block 延迟 invalid/GC。

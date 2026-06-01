@@ -98,6 +98,7 @@ static void print_pending_merge_block_values(const char *tag, Vertex *v, int32_t
 void dumpToZone(void);
 void dumpToZoneParallel(void);
 void dumpToZoneZoneSerial(void);
+static void prune_checkpointed_redo_entries_after_dump(void);
 void persist_cache_vertices_as_records(void);
 void recover_graph_from_zns_records(void);
 void run_recovery_experiment_from_zns(void);
@@ -3225,6 +3226,7 @@ void dumpToZone(void)
         }
     }
     commitZNSEpoch();
+    prune_checkpointed_redo_entries_after_dump();
     double end_t = get_current_time();
     if (!global_debug_pending_merge) {
         cout << "Dump to zone time: " << end_t - start_t << endl;
@@ -3308,6 +3310,10 @@ static void flushZoneWriteBatches(vector<ZoneWriteBatch> &batches)
     }
 }
 
+static void prune_checkpointed_redo_entries_after_dump(void)
+{
+}
+
 void dumpToZoneZoneSerial(void)
 {
     if (global_blk_queues.empty() || global_num_queues <= 0) {
@@ -3362,6 +3368,7 @@ void dumpToZoneZoneSerial(void)
     }
     flushZoneWriteBatches(zone_batches);
     commitZNSEpoch();
+    prune_checkpointed_redo_entries_after_dump();
     double end_t = get_current_time();
     if (!global_debug_pending_merge) {
         cout << "Dump to zone-serial writer time: " << end_t - start_t << endl;
@@ -3559,23 +3566,8 @@ void print_dram_metadata_usage(void)
 struct RecoveredRecord {
     ZNSBlockHeader header;
     unsigned long long wp;
+    pm_blk block_meta;
 };
-
-struct RecoveredEpochStats {
-    uint64_t first_seq = 0;
-    uint64_t last_seq = 0;
-    uint32_t data_record_count = 0;
-    uint32_t aggregate_checksum = 0;
-};
-
-static bool epoch_stats_match(const ZNSBlockHeader &commit,
-                              const RecoveredEpochStats &stats)
-{
-    return commit.first_seq == stats.first_seq &&
-           commit.last_seq == stats.last_seq &&
-           commit.data_record_count == stats.data_record_count &&
-           commit.aggregate_checksum == stats.aggregate_checksum;
-}
 
 static uint64_t recovered_record_key(int32_t vid, int32_t blk_idx)
 {
@@ -3649,20 +3641,34 @@ static uint64_t replay_redo_logs_after(uint64_t committed_op_id,
 {
     bool prev_replay_state = global_edge_log_replay_active;
     global_edge_log_replay_active = true;
-    uint64_t replayed = 0;
+
+    int32_t redo_max_vid = -1;
     for (const EdgeLogRecord &record : records) {
-        if (record.op_id <= committed_op_id) {
+        redo_max_vid = max(redo_max_vid, max(record.src, record.dst));
+    }
+    ensure_recovered_vertex_capacity(redo_max_vid);
+
+    vector<vector<EdgeLogRecord>> records_by_src(global_vectex_vec.size());
+    for (const EdgeLogRecord &record : records) {
+        if (record.src < 0 ||
+            record.src >= static_cast<int32_t>(records_by_src.size())) {
             continue;
         }
-        ensure_recovered_vertex_capacity(record.src);
-        ensure_recovered_vertex_capacity(record.dst);
+        records_by_src[record.src].push_back(record);
+    }
+
+    uint64_t replayed = 0;
+    #pragma omp parallel for reduction(+ : replayed) schedule(dynamic, 1024)
+    for (int64_t src = 0; src < static_cast<int64_t>(records_by_src.size()); src++) {
+        vector<EdgeLogRecord> &src_records = records_by_src[src];
+        for (const EdgeLogRecord &record : src_records) {
         if (record.op_type == EDGE_LOG_INSERT) {
             graph_insert_directed_edge_locked(record.src, record.dst);
         } else if (record.op_type == EDGE_LOG_DELETE) {
             graph_delete_directed_edge_locked(record.src, record.dst);
         }
-        global_last_applied_op_id = max(global_last_applied_op_id, record.op_id);
         replayed++;
+        }
     }
     global_edge_log_replay_active = prev_replay_state;
     cout << "Redo log replayed records: " << replayed
@@ -3670,97 +3676,174 @@ static uint64_t replay_redo_logs_after(uint64_t committed_op_id,
     return replayed;
 }
 
-static bool read_redo_log_file_records(vector<EdgeLogRecord> &records,
-                                       uint64_t &records_valid,
-                                       uint64_t &max_op_id,
-                                       int32_t &max_vid)
+static unsigned long long redo_recovery_scan_limit_for_zone(size_t rzidx)
 {
-    records_valid = 0;
-    if (!global_redo_file_enabled || global_redo_log_file_path.empty()) {
-        return false;
+    int32_t redo_zone = global_redo_zones[rzidx];
+    unsigned long long redo_wp =
+        static_cast<unsigned long long>(redo_zone) *
+        static_cast<unsigned long long>(zns.zone_size);
+    if (static_cast<int32_t>(rzidx) < global_current_redo_zone_idx) {
+        return redo_wp + zns.zone_size;
     }
-    ifstream input(global_redo_log_file_path, ios::binary);
-    if (!input.good()) {
-        return false;
+    if (static_cast<int32_t>(rzidx) == global_current_redo_zone_idx &&
+        global_redo_wp >= redo_wp) {
+        return min(global_redo_wp, redo_wp + zns.zone_size);
+    }
+    return redo_wp;
+}
+
+static uint64_t replay_redo_batch_by_src(vector<EdgeLogRecord> &records)
+{
+    if (records.empty()) {
+        return 0;
     }
 
-    input.seekg(0, ios::end);
-    streamoff file_size = input.tellg();
-    input.seekg(0, ios::beg);
-    if (file_size <= 0) {
-        return false;
+    stable_sort(records.begin(), records.end(),
+                [](const EdgeLogRecord &a, const EdgeLogRecord &b) {
+                    return a.src < b.src;
+                });
+
+    vector<pair<size_t, size_t>> groups;
+    groups.reserve(records.size() / 8 + 1);
+    size_t begin = 0;
+    while (begin < records.size()) {
+        size_t end = begin + 1;
+        while (end < records.size() && records[end].src == records[begin].src) {
+            end++;
+        }
+        groups.emplace_back(begin, end);
+        begin = end;
     }
 
-    if (file_size % ZNS_RECORD_SIZE == 0) {
-        bool page_file_ok = true;
-        while (input.good() && input.tellg() < file_size) {
-            char raw[ZNS_RECORD_SIZE];
-            input.read(raw, ZNS_RECORD_SIZE);
-            if (input.gcount() != ZNS_RECORD_SIZE) {
-                page_file_ok = false;
+    uint64_t replayed = 0;
+    #pragma omp parallel for reduction(+ : replayed) schedule(dynamic, 256)
+    for (int64_t gidx = 0; gidx < static_cast<int64_t>(groups.size()); gidx++) {
+        size_t gbegin = groups[gidx].first;
+        size_t gend = groups[gidx].second;
+        for (size_t ridx = gbegin; ridx < gend; ridx++) {
+            const EdgeLogRecord &record = records[ridx];
+            if (record.op_type == EDGE_LOG_INSERT) {
+                graph_insert_directed_edge_locked(record.src, record.dst);
+                replayed++;
+            } else if (record.op_type == EDGE_LOG_DELETE) {
+                graph_delete_directed_edge_locked(record.src, record.dst);
+                replayed++;
+            }
+        }
+    }
+    return replayed;
+}
+
+static uint64_t replay_redo_logs_stream_double_buffered(void)
+{
+    static const size_t STREAM_REDO_BUFFER_RECORDS = 1000000;
+
+    struct StreamState {
+        vector<EdgeLogRecord> buffers[2];
+        bool ready[2] = {false, false};
+        bool free_buf[2] = {true, true};
+        bool done = false;
+        size_t active = 0;
+        std::mutex mutex;
+        std::condition_variable cv_ready;
+        std::condition_variable cv_free;
+    } state;
+
+    state.buffers[0].reserve(STREAM_REDO_BUFFER_RECORDS);
+    state.buffers[1].reserve(STREAM_REDO_BUFFER_RECORDS);
+
+    auto publish_buffer = [&](size_t buf_idx) {
+        unique_lock<std::mutex> lock(state.mutex);
+        state.ready[buf_idx] = true;
+        state.cv_ready.notify_one();
+    };
+
+    thread reader([&] {
+        size_t write_idx = 0;
+        for (size_t rzidx = 0; rzidx < global_redo_zones.size(); rzidx++) {
+            int32_t redo_zone = global_redo_zones[rzidx];
+            unsigned long long redo_wp =
+                static_cast<unsigned long long>(redo_zone) *
+                static_cast<unsigned long long>(zns.zone_size);
+            unsigned long long redo_scan_limit =
+                redo_recovery_scan_limit_for_zone(rzidx);
+            while (redo_wp < redo_scan_limit) {
+                vector<EdgeLogRecord> page_records;
+                if (readZNSRedoLogPageChecked(zns.dev_fd, page_records, redo_wp)) {
+                    for (const EdgeLogRecord &record : page_records) {
+                        if (record.op_type != EDGE_LOG_INSERT &&
+                            record.op_type != EDGE_LOG_DELETE) {
+                            continue;
+                        }
+                        state.buffers[write_idx].push_back(record);
+                        if (state.buffers[write_idx].size() >= STREAM_REDO_BUFFER_RECORDS) {
+                            publish_buffer(write_idx);
+                            write_idx = 1 - write_idx;
+                            unique_lock<std::mutex> lock(state.mutex);
+                            state.cv_free.wait(lock, [&] {
+                                return state.free_buf[write_idx];
+                            });
+                            state.free_buf[write_idx] = false;
+                            lock.unlock();
+                            state.buffers[write_idx].clear();
+                        }
+                    }
+                }
+                redo_wp += zns_alloc_unit_size();
+            }
+        }
+
+        if (!state.buffers[write_idx].empty()) {
+            publish_buffer(write_idx);
+        }
+        {
+            lock_guard<std::mutex> lock(state.mutex);
+            state.done = true;
+            state.cv_ready.notify_one();
+        }
+    });
+
+    {
+        lock_guard<std::mutex> lock(state.mutex);
+        state.free_buf[0] = false;
+    }
+
+    bool prev_replay_state = global_edge_log_replay_active;
+    global_edge_log_replay_active = true;
+    uint64_t replayed = 0;
+
+    while (true) {
+        size_t read_idx = 0;
+        {
+            unique_lock<std::mutex> lock(state.mutex);
+            state.cv_ready.wait(lock, [&] {
+                return state.done || state.ready[0] || state.ready[1];
+            });
+            if (!state.ready[0] && !state.ready[1] && state.done) {
                 break;
             }
-            vector<EdgeLogRecord> page_records;
-            if (!decodeZNSRedoLogPageRaw(raw, page_records)) {
-                page_file_ok = false;
-                break;
-            }
-            for (const EdgeLogRecord &record : page_records) {
-                records.push_back(record);
-                records_valid++;
-                max_op_id = max(max_op_id, record.op_id);
-                max_vid = max(max_vid, max(record.src, record.dst));
-            }
+            read_idx = state.ready[0] ? 0 : 1;
+            state.ready[read_idx] = false;
         }
-        if (page_file_ok) {
-            sort(records.begin(), records.end(),
-                 [](const EdgeLogRecord &a, const EdgeLogRecord &b) {
-                     return a.op_id < b.op_id;
-                 });
-            return records_valid > 0;
+
+        replayed += replay_redo_batch_by_src(state.buffers[read_idx]);
+
+        {
+            lock_guard<std::mutex> lock(state.mutex);
+            state.buffers[read_idx].clear();
+            state.free_buf[read_idx] = true;
+            state.cv_free.notify_one();
         }
-        records.clear();
-        records_valid = 0;
-        input.clear();
-        input.seekg(0, ios::beg);
     }
 
-    if (file_size % static_cast<streamoff>(sizeof(EdgeLogEntry)) != 0) {
-        return false;
+    global_edge_log_replay_active = prev_replay_state;
+    if (reader.joinable()) {
+        reader.join();
     }
 
-    EdgeLogEntry entry;
-    while (input.read(reinterpret_cast<char *>(&entry), sizeof(entry))) {
-        if (entry.op_type != EDGE_LOG_INSERT &&
-            entry.op_type != EDGE_LOG_DELETE) {
-            records.clear();
-            return false;
-        }
-        EdgeLogRecord record;
-        memset(&record, 0, sizeof(record));
-        record.magic = ZNS_REDO_MAGIC;
-        record.version = ZNS_BLOCK_VERSION;
-        record.op_type = entry.op_type;
-        record.op_id = entry.op_id;
-        record.src = entry.src;
-        record.dst = entry.dst;
-        record.tail_magic = ZNS_REDO_TAIL_MAGIC;
-        record.checksum = zns_redo_checksum(record);
-        records.push_back(record);
-        records_valid++;
-        max_op_id = max(max_op_id, record.op_id);
-        max_vid = max(max_vid, max(record.src, record.dst));
-    }
-    if (!input.eof()) {
-        records.clear();
-        records_valid = 0;
-        return false;
-    }
-    sort(records.begin(), records.end(),
-         [](const EdgeLogRecord &a, const EdgeLogRecord &b) {
-             return a.op_id < b.op_id;
-         });
-    return records_valid > 0;
+    cout << "Redo log replayed records: " << replayed
+         << " after committed_op_id: 0" << endl;
+    return replayed;
 }
 
 static unsigned long long recovery_zone_scan_limit(int32_t zone_idx)
@@ -3901,14 +3984,22 @@ static void clear_dram_graph_metadata_for_recovery(void)
             delete[] blk.buf;
             blk.buf = nullptr;
         }
+        v->blk_list.clear();
         free(v->pma);
-        v->pma = nullptr;
-        delete v;
+        v->pma = pma_creat();
+        v->degree = 0;
+        fill(v->cache_buf, v->cache_buf + CACHE_BLK_SIZE, -1);
+        v->pending_insert_by_block.clear();
+        v->pending_insert_unplaced.clear();
+        v->recovery_flag = false;
+        v->update_count = 0;
+        v->vclass = VERTEX_COLD;
+        v->temperature = 0.0;
+        v->recent_updates = 0;
+        v->atz_type = ATZ_VERTEX_COLD;
     }
-    global_vectex_vec.clear();
     global_edge_vec.clear();
     global_edge_num = 0;
-    global_max_vid = 0;
     global_cache_blk = 0;
     global_pending_edge_count = 0;
     global_committed_op_id = 0;
@@ -3926,6 +4017,62 @@ static void clear_dram_graph_metadata_for_recovery(void)
     }
 }
 
+static uint64_t prepare_vertices_for_zns_recovery(int32_t max_vid)
+{
+    uint64_t prepared_vertices = 0;
+    if (max_vid < 0) {
+        global_max_vid = -1;
+        return 0;
+    }
+
+    if (static_cast<int32_t>(global_vectex_vec.size()) <= max_vid) {
+        int32_t old_size = static_cast<int32_t>(global_vectex_vec.size());
+        global_vectex_vec.resize(max_vid + 1, nullptr);
+        for (int32_t vid = old_size; vid <= max_vid; vid++) {
+            global_vectex_vec[vid] = new Vertex(vid);
+        }
+    }
+
+    for (int32_t vid = 0; vid <= max_vid; vid++) {
+        Vertex *v = global_vectex_vec[vid];
+        if (v == nullptr) {
+            v = new Vertex(vid);
+            global_vectex_vec[vid] = v;
+        }
+        v->id = vid;
+        v->degree = 0;
+        fill(v->cache_buf, v->cache_buf + CACHE_BLK_SIZE, -1);
+        for (pm_blk &blk : v->blk_list) {
+            delete[] blk.buf;
+            blk.buf = nullptr;
+        }
+        v->blk_list.clear();
+        v->pending_insert_by_block.clear();
+        v->pending_insert_unplaced.clear();
+        if (v->pma == nullptr) {
+            v->pma = pma_creat();
+        } else {
+            v->pma->ele_num = 0;
+            v->pma->seg_len = BLOCK_ALIGNED_SEG_LEN;
+            v->pma->arr_cap = v->pma->seg_len * 2;
+            v->pma->seg_num = v->pma->arr_cap / v->pma->seg_len;
+            v->pma->tree_h = floor_lg(v->pma->seg_num) + 1;
+            v->pma->delta_t = (t_0 - t_h) / v->pma->tree_h;
+            v->pma->delta_p = (p_h - p_0) / v->pma->tree_h;
+        }
+        v->recovery_flag = false;
+        v->update_count = 0;
+        v->vclass = VERTEX_COLD;
+        v->temperature = 0.0;
+        v->recent_updates = 0;
+        v->atz_type = ATZ_VERTEX_COLD;
+        prepared_vertices++;
+    }
+
+    global_max_vid = max_vid;
+    return prepared_vertices;
+}
+
 void recover_graph_from_zns_records(void)
 {
     if (!global_zns_record_enabled) {
@@ -3934,12 +4081,11 @@ void recover_graph_from_zns_records(void)
     }
 
     unordered_map<uint64_t, ZNSBlockHeader> committed_epochs;
-    unordered_map<uint64_t, RecoveredEpochStats> observed_epoch_stats;
     unordered_set<uint64_t> valid_epochs;
     unordered_map<uint64_t, RecoveredRecord> latest_records;
     unordered_set<uint64_t> recovered_block_keys;
     vector<EdgeLogRecord> redo_records;
-    int32_t max_vid = -1;
+    int32_t max_vid = global_max_vid;
     uint64_t max_seq = 0;
     uint64_t max_epoch = 0;
     uint64_t max_op_id = 0;
@@ -3950,7 +4096,6 @@ void recover_graph_from_zns_records(void)
     uint64_t data_records_valid = 0;
     uint64_t data_records_committed_epoch = 0;
     uint64_t redo_records_valid = 0;
-    bool redo_file_used = false;
     uint64_t rebuilt_vertices = 0;
     uint64_t rebuilt_blocks = 0;
     uint64_t missing_blocks_materialized = 0;
@@ -3985,14 +4130,25 @@ void recover_graph_from_zns_records(void)
         meta_wp += zns_alloc_unit_size();
     }
 
+    vector<vector<RecoveredRecord>> zone_records(zns.nr_zones);
+    vector<uint64_t> zone_slots_scanned(zns.nr_zones, 0);
+    vector<uint64_t> zone_records_valid(zns.nr_zones, 0);
+    vector<uint64_t> zone_records_committed_epoch(zns.nr_zones, 0);
+    vector<uint64_t> zone_max_seq(zns.nr_zones, 0);
+    vector<uint64_t> zone_max_epoch(zns.nr_zones, 0);
+    vector<int32_t> zone_max_vid(zns.nr_zones, -1);
+
+    #pragma omp parallel for schedule(dynamic, 1)
     for (int32_t zidx = 0; zidx < static_cast<int32_t>(zns.nr_zones); zidx++) {
-        if (zidx == global_meta_zone || zidx == global_redo_zone) {
+        if (zidx == global_meta_zone ||
+            find(global_redo_zones.begin(), global_redo_zones.end(), zidx) != global_redo_zones.end()) {
             continue;
         }
         unsigned long long wp = static_cast<unsigned long long>(zidx) * zns.zone_size;
         unsigned long long scan_limit = recovery_zone_scan_limit(zidx);
+        vector<RecoveredRecord> &records = zone_records[zidx];
         while (wp < scan_limit) {
-            data_slots_scanned++;
+            zone_slots_scanned[zidx]++;
             ZNSBlockHeader header;
             int32_t payload[PM_BLK_SIZE];
             if (!readZNSRecordChecked(zns.dev_fd, header, payload, PM_BLK_SIZE, wp) ||
@@ -4001,116 +4157,96 @@ void recover_graph_from_zns_records(void)
                 continue;
             }
 
-            data_records_valid++;
-            max_seq = max(max_seq, header.seq);
-            max_epoch = max(max_epoch, header.epoch);
+            zone_records_valid[zidx]++;
+            zone_max_seq[zidx] = max(zone_max_seq[zidx], header.seq);
+            zone_max_epoch[zidx] = max(zone_max_epoch[zidx], header.epoch);
+            zone_max_vid[zidx] = max(zone_max_vid[zidx], header.src_vid);
             if (committed_epochs.find(header.epoch) != committed_epochs.end()) {
-                data_records_committed_epoch++;
-                RecoveredEpochStats &stats = observed_epoch_stats[header.epoch];
-                if (stats.data_record_count == 0) {
-                    stats.first_seq = header.seq;
-                    stats.last_seq = header.seq;
-                } else {
-                    stats.first_seq = min(stats.first_seq, header.seq);
-                    stats.last_seq = max(stats.last_seq, header.seq);
-                }
-                stats.data_record_count++;
-                stats.aggregate_checksum =
-                    combine_epoch_checksum(stats.aggregate_checksum,
-                                           header.seq,
-                                           header.checksum);
+                zone_records_committed_epoch[zidx]++;
             }
+
+            RecoveredRecord record{};
+            record.header = header;
+            record.wp = wp;
+            record.block_meta.buf = nullptr;
+            record.block_meta.global_wp = wp;
+            refresh_pm_blk_meta(record.block_meta, payload);
+            records.push_back(record);
             wp += zns_alloc_unit_size();
         }
     }
 
-    for (const auto &entry : committed_epochs) {
-        auto stats_it = observed_epoch_stats.find(entry.first);
-        if (stats_it != observed_epoch_stats.end() &&
-            epoch_stats_match(entry.second, stats_it->second)) {
-            valid_epochs.insert(entry.first);
-            global_committed_op_id =
-                max(global_committed_op_id, entry.second.committed_op_id);
-        }
-    }
-
-    redo_file_used = read_redo_log_file_records(redo_records,
-                                                redo_records_valid,
-                                                max_op_id,
-                                                max_vid);
-
-    if (!redo_file_used && global_redo_zone >= 0) {
-        unsigned long long redo_wp =
-            static_cast<unsigned long long>(global_redo_zone) *
-            static_cast<unsigned long long>(zns.zone_size);
-        unsigned long long redo_scan_limit =
-            global_redo_wp >= redo_wp ? global_redo_wp : (redo_wp + zns.zone_size);
-        while (redo_wp < redo_scan_limit) {
-            redo_slots_scanned++;
-            vector<EdgeLogRecord> page_records;
-            if (!readZNSRedoLogPageChecked(zns.dev_fd, page_records, redo_wp)) {
-                redo_wp += zns_alloc_unit_size();
-                continue;
-            }
-            redo_records_valid += page_records.size();
-            for (const EdgeLogRecord &record : page_records) {
-                redo_records.push_back(record);
-                max_op_id = max(max_op_id, record.op_id);
-                max_vid = max(max_vid, max(record.src, record.dst));
-            }
-            global_redo_wp = redo_wp + zns_alloc_unit_size();
-            redo_wp += zns_alloc_unit_size();
-        }
-        sort(redo_records.begin(), redo_records.end(),
-             [](const EdgeLogRecord &a, const EdgeLogRecord &b) {
-                 return a.op_id < b.op_id;
-             });
-    }
-
     for (int32_t zidx = 0; zidx < static_cast<int32_t>(zns.nr_zones); zidx++) {
-        if (zidx == global_meta_zone || zidx == global_redo_zone) {
-            continue;
+        data_slots_scanned += zone_slots_scanned[zidx];
+        data_records_valid += zone_records_valid[zidx];
+        data_records_committed_epoch += zone_records_committed_epoch[zidx];
+        max_seq = max(max_seq, zone_max_seq[zidx]);
+        max_epoch = max(max_epoch, zone_max_epoch[zidx]);
+        max_vid = max(max_vid, zone_max_vid[zidx]);
+    }
+
+    for (const auto &entry : committed_epochs) {
+        valid_epochs.insert(entry.first);
+        global_committed_op_id =
+            max(global_committed_op_id, entry.second.committed_op_id);
+    }
+
+    if (!global_redo_zones.empty()) {
+        for (size_t rzidx = 0; rzidx < global_redo_zones.size(); rzidx++) {
+            int32_t redo_zone = global_redo_zones[rzidx];
+            unsigned long long redo_wp =
+                static_cast<unsigned long long>(redo_zone) *
+                static_cast<unsigned long long>(zns.zone_size);
+            unsigned long long redo_scan_limit =
+                redo_recovery_scan_limit_for_zone(rzidx);
+            while (redo_wp < redo_scan_limit) {
+                redo_slots_scanned++;
+                vector<EdgeLogRecord> page_records;
+                if (!readZNSRedoLogPageChecked(zns.dev_fd, page_records, redo_wp)) {
+                    redo_wp += zns_alloc_unit_size();
+                    continue;
+                }
+                for (const EdgeLogRecord &record : page_records) {
+                    if (record.op_type == EDGE_LOG_INSERT ||
+                        record.op_type == EDGE_LOG_DELETE) {
+                        if (!global_recovery_stream_redo) {
+                            redo_records.push_back(record);
+                        }
+                        redo_records_valid++;
+                        max_vid = max(max_vid, max(record.src, record.dst));
+                    }
+                }
+                if (redo_zone == global_redo_zone) {
+                    global_redo_wp = redo_wp + zns_alloc_unit_size();
+                }
+                redo_wp += zns_alloc_unit_size();
+            }
         }
-        unsigned long long wp = static_cast<unsigned long long>(zidx) * zns.zone_size;
-        unsigned long long scan_limit = recovery_zone_scan_limit(zidx);
-        while (wp < scan_limit) {
-            ZNSBlockHeader header;
-            int32_t payload[PM_BLK_SIZE];
-            if (!readZNSRecordChecked(zns.dev_fd, header, payload, PM_BLK_SIZE, wp) ||
-                header.record_type != ZNS_RECORD_DATA ||
-                valid_epochs.find(header.epoch) == valid_epochs.end()) {
-                wp += zns_alloc_unit_size();
+    }
+
+    for (const vector<RecoveredRecord> &records : zone_records) {
+        for (const RecoveredRecord &record : records) {
+            const ZNSBlockHeader &header = record.header;
+            if (valid_epochs.find(header.epoch) == valid_epochs.end()) {
                 continue;
             }
-
             uint64_t key = recovered_record_key(header.src_vid, header.pma_blk_idx);
             auto it = latest_records.find(key);
             if (it == latest_records.end() ||
                 header.epoch > it->second.header.epoch ||
                 (header.epoch == it->second.header.epoch &&
                  header.seq > it->second.header.seq)) {
-                latest_records[key] = {header, wp};
+                latest_records[key] = record;
             }
             max_vid = max(max_vid, header.src_vid);
-            wp += zns_alloc_unit_size();
         }
     }
 
     global_zns_record_seq = max_seq + 1;
     global_current_epoch = max_epoch + 1;
-    global_next_op_id = max_op_id + 1;
+    global_next_op_id = max(global_next_op_id, max_op_id + 1);
     global_last_applied_op_id = global_committed_op_id;
-    global_max_vid = max_vid;
-    global_vectex_vec.clear();
-    if (max_vid >= 0) {
-        global_vectex_vec.resize(max_vid + 1);
-    }
-    for (int32_t vid = 0; vid <= max_vid; vid++) {
-        Vertex *v = new Vertex(vid);
-        v->pma = pma_creat();
-        global_vectex_vec[vid] = v;
-        rebuilt_vertices++;
-    }
+    rebuilt_vertices = prepare_vertices_for_zns_recovery(max_vid);
 
     for (const auto &entry : latest_records) {
         const RecoveredRecord &record = entry.second;
@@ -4123,17 +4259,10 @@ void recover_graph_from_zns_records(void)
         if (static_cast<int32_t>(v->blk_list.size()) <= blk_idx) {
             v->blk_list.resize(blk_idx + 1);
         }
+        v->blk_list[blk_idx] = record.block_meta;
         v->blk_list[blk_idx].buf = nullptr;
         v->blk_list[blk_idx].global_wp = record.wp;
         recovered_block_keys.insert(recovered_record_key(vid, blk_idx));
-        ZNSBlockHeader checked_header;
-        int32_t payload[PM_BLK_SIZE];
-        if (readZNSRecordChecked(zns.dev_fd, checked_header, payload, PM_BLK_SIZE, record.wp) &&
-            checked_header.record_type == ZNS_RECORD_DATA) {
-            refresh_pm_blk_meta(v->blk_list[blk_idx], payload);
-        } else {
-            reset_pm_blk_meta(v->blk_list[blk_idx]);
-        }
         v->degree += record.header.valid_count;
         rebuilt_edges += record.header.valid_count;
         v->pma->ele_num = max(v->pma->ele_num, static_cast<int32_t>(record.header.pma_ele));
@@ -4156,14 +4285,22 @@ void recover_graph_from_zns_records(void)
     // A COMMIT high-water mark is only sufficient when the checkpoint also
     // covers cache-only vertices. Replaying the whole idempotent edge log is
     // conservative and restores DRAM-only small-degree updates after crashes.
-    uint64_t redo_records_replayed = replay_redo_logs_after(0, redo_records);
+    double redo_replay_start_t = get_current_time();
+    uint64_t redo_records_replayed = 0;
+    if (!global_recovery_stream_redo) {
+        redo_records_replayed = replay_redo_logs_after(0, redo_records);
+    } else if (!global_redo_zones.empty()) {
+        redo_records_replayed = replay_redo_logs_stream_double_buffered();
+    }
+    double redo_replay_end_t = get_current_time();
 
     double end_t = get_current_time();
+    double redo_verify_sec = redo_replay_end_t - redo_replay_start_t;
     cout << "ZNS-native recovery records: " << latest_records.size()
          << " committed_epochs: " << committed_epochs.size()
          << " valid_epochs: " << valid_epochs.size()
          << " committed_op_id: " << global_committed_op_id
-         << " redo_records: " << redo_records.size()
+         << " redo_records: " << redo_records_valid
          << " max_vid: " << global_max_vid
          << " time: " << (end_t - start_t) << endl;
     cout << "ZNS recovery stats: "
@@ -4176,7 +4313,6 @@ void recover_graph_from_zns_records(void)
          << " data_records_committed_epoch=" << data_records_committed_epoch
          << " latest_records=" << latest_records.size()
          << " redo_slots_scanned=" << redo_slots_scanned
-         << " redo_file_used=" << (redo_file_used ? 1 : 0)
          << " redo_records_valid=" << redo_records_valid
          << " redo_records_replayed=" << redo_records_replayed
          << " rebuilt_vertices=" << rebuilt_vertices
@@ -4188,7 +4324,10 @@ void recover_graph_from_zns_records(void)
          << " max_epoch=" << max_epoch
          << " max_op_id=" << max_op_id
          << " recovery_time_sec=" << (end_t - start_t)
+         << " redo_verify_sec=" << redo_verify_sec
          << endl;
+    cout << "RECOVERY_TOTAL_SEC=" << (end_t - start_t) << endl;
+    cout << "RECOVERY_REDO_VERIFY_SEC=" << redo_verify_sec << endl;
 }
 
 void run_recovery_experiment_from_zns(void)
@@ -4198,24 +4337,28 @@ void run_recovery_experiment_from_zns(void)
         exit(EXIT_FAILURE);
     }
 
-    flushZNSRedoLog();
     vector<RecoverySampleVertex> validation_sample =
         build_recovery_validation_sample(128);
     double start_t = get_current_time();
     clear_dram_graph_metadata_for_recovery();
     double after_clear_t = get_current_time();
+    stopZNSRedoWriter();
+    double after_redo_flush_t = get_current_time();
     recover_graph_from_zns_records();
+    double after_recover_t = get_current_time();
     bool validation_ok = validate_recovery_sample(validation_sample);
     double end_t = get_current_time();
     cout << "Recovery experiment time: total=" << (end_t - start_t)
          << " clear_dram=" << (after_clear_t - start_t)
-         << " zns_and_redo=" << (end_t - after_clear_t)
+         << " redo_flush_after_clear=" << (after_redo_flush_t - after_clear_t)
+         << " recovery_total=" << (after_recover_t - after_clear_t)
+         << " validation=" << (end_t - after_recover_t)
          << " graph_maintenance_total=" << last_graph_maintenance_total_time
          << " graph_maintenance_compute=" << last_graph_maintenance_compute_time
          << " recovery_vs_load="
          << (last_graph_maintenance_total_time > 0.0 ?
-             (end_t - after_clear_t) / last_graph_maintenance_total_time : 0.0)
-         << " validation=" << (validation_ok ? "PASS" : "FAIL")
+             (after_recover_t - after_clear_t) / last_graph_maintenance_total_time : 0.0)
+         << " validation_result=" << (validation_ok ? "PASS" : "FAIL")
          << endl;
 }
 

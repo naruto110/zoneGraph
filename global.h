@@ -18,6 +18,9 @@
 #include <omp.h>
 #include <shared_mutex>
 #include <mutex>
+#include <condition_variable>
+#include <thread>
+#include <deque>
 #include <atomic>
 #include <random>
 #include <cstdint>
@@ -78,7 +81,6 @@ struct EdgeLogRecord {
 	uint32_t version;
 	uint32_t op_type;
 	uint32_t reserved;
-	uint64_t op_id;
 	int32_t src;
 	int32_t dst;
 	uint32_t checksum;
@@ -86,7 +88,6 @@ struct EdgeLogRecord {
 };
 
 struct EdgeLogEntry {
-	uint64_t op_id;
 	int32_t src;
 	int32_t dst;
 	uint32_t op_type;
@@ -258,9 +259,7 @@ public:
 int nr_blocks_perzone = 0;
 bool global_zns_record_enabled = true;
 bool global_redo_log_enabled = false;
-bool global_redo_file_enabled = true;
-string global_redo_log_file_path = "/home/femu/project/zoneGraph/redo.log";
-FILE *global_redo_log_file = nullptr;
+bool global_recovery_stream_redo = false;
 uint64_t global_zns_record_seq = 1;
 uint64_t global_current_epoch = 1;
 bool global_zns_epoch_active = false;
@@ -272,6 +271,8 @@ int32_t global_meta_zone = -1;
 unsigned long long global_meta_wp = 0;
 int32_t global_redo_zone = -1;
 unsigned long long global_redo_wp = 0;
+vector<int32_t> global_redo_zones;
+int32_t global_current_redo_zone_idx = 0;
 uint64_t global_next_op_id = 1;
 uint64_t global_last_applied_op_id = 0;
 uint64_t global_committed_op_id = 0;
@@ -283,8 +284,18 @@ std::mutex global_zns_device_write_mutex;
 std::mutex global_gc_mutex;
 std::mutex global_pending_merge_mutex;
 std::shared_timed_mutex global_query_update_mutex;
-EdgeLogEntry global_redo_page_entries[ZNS_REDO_ENTRIES_PER_PAGE];
-uint32_t global_redo_page_count = 0;
+vector<EdgeLogEntry> global_redo_pending_entries;
+deque<vector<EdgeLogEntry>> global_redo_write_queue;
+condition_variable global_redo_writer_cv;
+condition_variable global_redo_writer_drained_cv;
+condition_variable global_redo_writer_space_cv;
+thread global_redo_writer_thread;
+bool global_redo_writer_running = false;
+bool global_redo_writer_stop = false;
+uint32_t global_redo_writer_active_batches = 0;
+size_t global_redo_writer_queued_entries = 0;
+const size_t global_redo_flush_entry_threshold = 262144;
+const size_t global_redo_max_queued_entries = 64 * global_redo_flush_entry_threshold;
 
 class MemoryWPQueue {
 public:
