@@ -46,7 +46,7 @@ def plot(output_dir: Path):
     x = np.arange(len(DATASETS))
     width = 0.18
 
-    fig, ax = plt.subplots(figsize=(7.2, 2.9))
+    fig, ax = plt.subplots(figsize=(7.2, 2.65))
 
     colors = {
         "zone_algorithm": "#2F5D8C",
@@ -131,15 +131,20 @@ def plot(output_dir: Path):
         ncol=5,
         frameon=False,
         loc="upper center",
-        bbox_to_anchor=(0.5, 1.22),
+        bbox_to_anchor=(0.5, -0.16),
         columnspacing=0.8,
         handlelength=1.3,
         handletextpad=0.35,
     )
 
-    fig.tight_layout(pad=0.35)
-    fig.savefig(output_dir / "edge_insertion_maintenance.pdf", bbox_inches="tight")
-    fig.savefig(output_dir / "edge_insertion_maintenance.png", dpi=600, bbox_inches="tight")
+    fig.subplots_adjust(left=0.075, right=0.995, top=0.995, bottom=0.245)
+    fig.savefig(output_dir / "edge_insertion_maintenance.pdf", bbox_inches="tight", pad_inches=0.01)
+    fig.savefig(
+        output_dir / "edge_insertion_maintenance.png",
+        dpi=600,
+        bbox_inches="tight",
+        pad_inches=0.01,
+    )
 
 
 if __name__ == "__main__":
