@@ -46,20 +46,14 @@ def plot(output_dir: Path):
     x = np.arange(len(DATASETS))
     width = 0.18
 
-    fig, (ax, ax_breakdown) = plt.subplots(
-        2,
-        1,
-        figsize=(6.8, 3.9),
-        gridspec_kw={"height_ratios": [2.5, 1.0], "hspace": 0.16},
-        sharex=True,
-    )
+    fig, ax = plt.subplots(figsize=(6.8, 2.75))
 
     colors = {
-        "zone_algorithm": "#4C78A8",
-        "zone_dump": "#9EC3E6",
-        "live": "#F58518",
-        "lsm": "#54A24B",
-        "mbf": "#B279A2",
+        "zone_algorithm": "#2F5D8C",
+        "zone_dump": "#8FB7D8",
+        "live": "#D07A2D",
+        "lsm": "#5B8E3E",
+        "mbf": "#8C6BB1",
     }
 
     ax.bar(
@@ -124,6 +118,8 @@ def plot(output_dir: Path):
 
     ax.set_yscale("log")
     ax.set_ylabel("Maintenance time (s)")
+    ax.set_xticks(x)
+    ax.set_xticklabels(DATASETS, rotation=18, ha="right")
     ax.set_ylim(0.08, 500)
     ax.grid(axis="y", which="major", linestyle="--", linewidth=0.45, alpha=0.45)
     ax.set_axisbelow(True)
@@ -140,38 +136,6 @@ def plot(output_dir: Path):
         handlelength=1.3,
         handletextpad=0.35,
     )
-
-    update_pct = ZONEGRAPH_ALGORITHM / ZONEGRAPH_TOTAL * 100.0
-    flush_pct = ZONEGRAPH_DUMP / ZONEGRAPH_TOTAL * 100.0
-    ax_breakdown.bar(
-        x,
-        update_pct,
-        0.55,
-        label="ZoneGraph update",
-        color=colors["zone_algorithm"],
-        edgecolor="black",
-        linewidth=0.45,
-    )
-    ax_breakdown.bar(
-        x,
-        flush_pct,
-        0.55,
-        bottom=update_pct,
-        label="ZoneGraph flush",
-        color=colors["zone_dump"],
-        edgecolor="black",
-        linewidth=0.45,
-        hatch="//",
-    )
-    ax_breakdown.set_ylim(0, 100)
-    ax_breakdown.set_ylabel("ZG breakdown (%)")
-    ax_breakdown.set_xticks(x)
-    ax_breakdown.set_xticklabels(DATASETS, rotation=18, ha="right")
-    ax_breakdown.grid(axis="y", linestyle="--", linewidth=0.45, alpha=0.45)
-    ax_breakdown.set_axisbelow(True)
-
-    for spine in ["top", "right"]:
-        ax_breakdown.spines[spine].set_visible(False)
 
     fig.tight_layout(pad=0.35)
     fig.savefig(output_dir / "edge_insertion_maintenance.pdf", bbox_inches="tight")
