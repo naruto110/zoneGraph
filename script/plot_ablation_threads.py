@@ -39,12 +39,12 @@ def plot(output_dir: Path):
     set_paper_style()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    fig, ax = plt.subplots(figsize=(5.4, 2.9))
+    fig, ax = plt.subplots(figsize=(5.2, 2.65))
 
     colors = {
-        "Skitter": "#2F5D8C",
-        "Pokec": "#D07A2D",
-        "LiveJournal": "#5B8E3E",
+        "Skitter": "#333333",
+        "Pokec": "#666666",
+        "LiveJournal": "#999999",
     }
     markers = {
         "Skitter": "o",
@@ -58,9 +58,20 @@ def plot(output_dir: Path):
             x,
             values,
             marker=markers[dataset],
-            markersize=4.8,
-            linewidth=1.6,
+            markersize=3.8,
+            markerfacecolor="white",
+            markeredgewidth=0.8,
+            linewidth=1.15,
             label=dataset,
+            color=colors[dataset],
+        )
+        ax.text(
+            x[-1] + 0.08,
+            values[-1],
+            dataset,
+            ha="left",
+            va="center",
+            fontsize=9,
             color=colors[dataset],
         )
 
@@ -68,6 +79,7 @@ def plot(output_dir: Path):
     ax.set_xticklabels([str(t) for t in THREADS])
     ax.set_xlabel("Threads")
     ax.set_ylabel("Load time (s)")
+    ax.set_xlim(-0.08, len(THREADS) - 1 + 0.95)
     ax.set_ylim(0, max(v.max() for v in DATA.values()) * 1.12)
     ax.grid(axis="y", linestyle="--", linewidth=0.45, alpha=0.45)
     ax.set_axisbelow(True)
@@ -75,17 +87,7 @@ def plot(output_dir: Path):
     for spine in ["top", "right"]:
         ax.spines[spine].set_visible(False)
 
-    ax.legend(
-        ncol=3,
-        frameon=False,
-        loc="upper center",
-        bbox_to_anchor=(0.5, -0.18),
-        columnspacing=1.0,
-        handlelength=1.5,
-        handletextpad=0.35,
-    )
-
-    fig.subplots_adjust(left=0.105, right=0.995, top=0.98, bottom=0.28)
+    fig.subplots_adjust(left=0.105, right=0.86, top=0.98, bottom=0.20)
     fig.savefig(output_dir / "ablation_threads.pdf", bbox_inches="tight", pad_inches=0.01)
     fig.savefig(output_dir / "ablation_threads.png", dpi=600, bbox_inches="tight", pad_inches=0.01)
 
