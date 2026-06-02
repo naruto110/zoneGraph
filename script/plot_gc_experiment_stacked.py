@@ -148,7 +148,8 @@ def plot_reduction(output_dir: Path):
         ("Moved blocks", MOVED_BLOCKS),
     ]
 
-    fig, axes = plt.subplots(1, 4, figsize=(9.6, 2.65), sharey=True)
+    fig, axes = plt.subplots(2, 2, figsize=(6.8, 4.7), sharey=True)
+    axes = axes.ravel()
     x = np.arange(len(DATASETS))
     width = 0.23
     legend_handles = None
@@ -180,7 +181,7 @@ def plot_reduction(output_dir: Path):
         ax.axhline(1.0, color="black", linewidth=0.6, linestyle=":")
         ax.set_title(metric_name, pad=3)
         ax.set_xticks(x)
-        ax.set_xticklabels(DATASETS, rotation=18, ha="right")
+        ax.set_xticklabels(DATASETS, rotation=0, ha="center")
         ax.set_ylim(0, 1.15)
         ax.grid(axis="y", linestyle="--", linewidth=0.45, alpha=0.45)
         ax.set_axisbelow(True)
@@ -207,7 +208,7 @@ def plot_reduction(output_dir: Path):
         handletextpad=0.35,
     )
 
-    fig.subplots_adjust(left=0.065, right=0.995, top=0.86, bottom=0.33, wspace=0.22)
+    fig.subplots_adjust(left=0.095, right=0.995, top=0.94, bottom=0.16, wspace=0.20, hspace=0.38)
     fig.savefig(output_dir / "gc_normalized_reduction.pdf", bbox_inches="tight", pad_inches=0.01)
     fig.savefig(output_dir / "gc_normalized_reduction.png", dpi=600, bbox_inches="tight", pad_inches=0.01)
 
@@ -215,7 +216,6 @@ def plot_reduction(output_dir: Path):
 def plot(output_dir: Path):
     set_paper_style()
     output_dir.mkdir(parents=True, exist_ok=True)
-    plot_runtime(output_dir)
     plot_reduction(output_dir)
 
 
