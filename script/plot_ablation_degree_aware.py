@@ -16,22 +16,16 @@ LOAD_TOTAL = {
     "LiveJournal": np.array([np.nan, 110.267, 67.507]),
 }
 
-BFS_AFTER = {
-    "Skitter": np.array([0.878071, 0.198872, 0.257756]),
-    "Pokec": np.array([0.657881, 0.460762, 0.254376]),
-    "LiveJournal": np.array([np.nan, 3.09994, 0.479365]),
+DUMP_COUNT = {
+    "Skitter": np.array([13, 5, 2]),
+    "Pokec": np.array([14, 10, 9]),
+    "LiveJournal": np.array([np.nan, 23, 18]),
 }
 
-PR_AFTER = {
-    "Skitter": np.array([6.28589, 2.77297, 1.97603]),
-    "Pokec": np.array([7.84037, 5.58421, 4.73186]),
-    "LiveJournal": np.array([np.nan, 102.407, 8.81988]),
-}
-
-WCC_AFTER = {
-    "Skitter": np.array([0.712816, 0.385615, 0.316512]),
-    "Pokec": np.array([0.810419, 0.58725, 0.522872]),
-    "LiveJournal": np.array([np.nan, 17.8464, 1.51922]),
+DUMP_TIME = {
+    "Skitter": np.array([26.7087, 8.22219, 3.20483]),
+    "Pokec": np.array([55.688, 27.7204, 20.2135]),
+    "LiveJournal": np.array([np.nan, 69.5317, 44.4088]),
 }
 
 
@@ -59,7 +53,7 @@ def set_paper_style():
 def grouped_bars(ax, data, ylabel, log=False):
     x = np.arange(len(DATASETS))
     width = 0.23
-    colors = ["#8C6BB1", "#59A14F", "#2F5D8C"]
+    colors = ["#2F5D8C", "#D07A2D", "#5B8E3E"]
     hatches = ["", "\\\\", "//"]
     handles = []
 
@@ -115,20 +109,17 @@ def plot(output_dir: Path):
     set_paper_style()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    fig, axes = plt.subplots(2, 2, figsize=(7.2, 4.8), sharex=False)
+    fig, axes = plt.subplots(1, 3, figsize=(8.4, 2.85), sharex=False)
     axes = axes.ravel()
 
     handles = grouped_bars(axes[0], LOAD_TOTAL, "Load time (s)", log=False)
-    axes[0].set_title("Graph maintenance", pad=3)
+    axes[0].set_title("Load total", pad=3)
 
-    grouped_bars(axes[1], BFS_AFTER, "BFS time (s)", log=True)
-    axes[1].set_title("BFS after dump", pad=3)
+    grouped_bars(axes[1], DUMP_COUNT, "Dump count", log=False)
+    axes[1].set_title("Dump count", pad=3)
 
-    grouped_bars(axes[2], PR_AFTER, "PageRank time (s)", log=True)
-    axes[2].set_title("PageRank after dump", pad=3)
-
-    grouped_bars(axes[3], WCC_AFTER, "WCC time (s)", log=True)
-    axes[3].set_title("WCC after dump", pad=3)
+    grouped_bars(axes[2], DUMP_TIME, "Dump time (s)", log=False)
+    axes[2].set_title("Dump time", pad=3)
 
     fig.legend(
         handles,
@@ -142,7 +133,7 @@ def plot(output_dir: Path):
         handletextpad=0.35,
     )
 
-    fig.subplots_adjust(left=0.085, right=0.995, top=0.94, bottom=0.16, wspace=0.26, hspace=0.38)
+    fig.subplots_adjust(left=0.07, right=0.995, top=0.86, bottom=0.28, wspace=0.30)
     fig.savefig(output_dir / "ablation_degree_aware.pdf", bbox_inches="tight", pad_inches=0.01)
     fig.savefig(output_dir / "ablation_degree_aware.png", dpi=600, bbox_inches="tight", pad_inches=0.01)
 
