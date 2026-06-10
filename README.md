@@ -111,7 +111,6 @@ The command-line driver uses numeric dataset ids defined in `main.cpp`. Common S
 19  as-Skitter
 20  soc-Pokec
 21  soc-LiveJournal1
-22  com-Orkut
 ```
 
 The corresponding paths are under:
@@ -145,7 +144,6 @@ Modes:
 ```text
 baseline   Insert directly into PMA-style blocks
 new        Degree-aware single-threaded path
-parallel   Parallel maintenance path
 parallel2  Default optimized parallel path
 ```
 
@@ -228,47 +226,3 @@ cd /home/femu/project/zoneGraph
 ./gc_skew_experiment --help
 ```
 
-Paper plotting scripts are under `script/`, including:
-
-```text
-plot_gc_experiment.py
-plot_recovery_experiment.py
-plot_ablation_degree_aware.py
-plot_ablation_cache_block_threshold.py
-plot_ablation_threads.py
-```
-
-## Reproducing Paper-Style Runs
-
-Additional command templates are maintained in:
-
-```text
-EXPERIMENT_COMMANDS.md
-```
-
-Cross-system comparison scripts live at the project root:
-
-```text
-/home/femu/project/scripts/run_graph_query_compare.sh
-/home/femu/project/scripts/run_zonegraph_ablation.sh
-```
-
-Result summaries from previous runs are stored under:
-
-```text
-/home/femu/project/results/
-zoneGraph/result/
-```
-
-## Notes and Limitations
-
-- The prototype expects a real or emulated ZNS/zoned block device and uses `libzbd`.
-- The default device path is `/dev/nvme0n1`; edit `global.h` for other environments.
-- The query benchmarks run on a stable graph state; structural updates and queries are not evaluated concurrently.
-- Graph reopen reconstructs runtime metadata from persisted records. It should not be interpreted as a full crash-consistency or power-loss recovery protocol.
-- Very large dirty-block thresholds can make maintenance closer to a DRAM-resident run; use regular dumps for persistent-storage evaluation.
-- Some files and scripts use absolute paths from the original evaluation environment and may need adjustment before reuse.
-
-## Citation
-
-If you use this prototype, please cite the accompanying paper draft when it becomes available.
