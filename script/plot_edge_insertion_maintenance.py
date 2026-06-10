@@ -23,12 +23,12 @@ def set_paper_style():
         {
             "font.family": "serif",
             "font.serif": ["Times New Roman", "Times", "DejaVu Serif"],
-            "font.size": 9,
-            "axes.labelsize": 9,
-            "axes.titlesize": 9,
-            "xtick.labelsize": 8,
-            "ytick.labelsize": 8,
-            "legend.fontsize": 8,
+            "font.size": 11,
+            "axes.labelsize": 11,
+            "axes.titlesize": 11,
+            "xtick.labelsize": 10,
+            "ytick.labelsize": 10,
+            "legend.fontsize": 10,
             "pdf.fonttype": 42,
             "ps.fonttype": 42,
             "axes.linewidth": 0.8,
@@ -124,17 +124,20 @@ def plot(output_dir: Path):
     ax.grid(axis="y", which="major", linestyle="--", linewidth=0.45, alpha=0.45)
     ax.set_axisbelow(True)
 
-    for spine in ["top", "right"]:
-        ax.spines[spine].set_visible(False)
+    # for spine in ["top", "right"]:
+    #     ax.spines[spine].set_visible(False)
 
     ax.legend(
-        ncol=5,
-        frameon=False,
-        loc="upper center",
-        bbox_to_anchor=(0.5, -0.16),
-        columnspacing=0.8,
-        handlelength=1.3,
-        handletextpad=0.35,
+      ncol=5,
+      frameon=True,          # 原来是 False
+      edgecolor="black",     # 边框颜色
+      fancybox=False,        # 直角边框
+      framealpha=1.0,        # 不透明
+      loc="upper center",
+      bbox_to_anchor=(0.5, -0.12),
+      columnspacing=0.8,
+      handlelength=1.3,
+      handletextpad=0.35,
     )
 
     fig.subplots_adjust(left=0.075, right=0.995, top=0.995, bottom=0.245)
@@ -145,6 +148,7 @@ def plot(output_dir: Path):
         bbox_inches="tight",
         pad_inches=0.01,
     )
+    plt.show()
 
 
 if __name__ == "__main__":

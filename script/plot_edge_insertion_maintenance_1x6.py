@@ -51,7 +51,7 @@ def plot(output_dir: Path):
         "mbf": "#8C6BB1",
     }
 
-    fig, axes = plt.subplots(1, 6, figsize=(10.2, 2.65), sharey=False)
+    fig, axes = plt.subplots(1, 6, figsize=(10.2, 2.2), sharey=False)
     x = np.arange(4)
     width = 0.62
 
@@ -140,24 +140,27 @@ def plot(output_dir: Path):
 
     fig.legend(
         legend_handles,
-        ["ZoneGraph update", "ZoneGraph flush", "LiveGraph", "LSMGraph", "MBFGraph"],
+        ["zoneGraph update", "zoneGraph flush", "LiveGraph", "LSMGraph", "MBFGraph"],
         ncol=5,
         frameon=False,
         loc="upper center",
-        bbox_to_anchor=(0.5, 0.02),
+        bbox_to_anchor=(0.5, 0.18),
         columnspacing=0.9,
         handlelength=1.3,
         handletextpad=0.35,
+        fontsize=11,
     )
 
     fig.subplots_adjust(left=0.055, right=0.995, top=0.88, bottom=0.28, wspace=0.34)
-    fig.savefig(output_dir / "edge_insertion_maintenance_1x6.pdf", bbox_inches="tight", pad_inches=0.01)
-    fig.savefig(
-        output_dir / "edge_insertion_maintenance_1x6.png",
-        dpi=600,
-        bbox_inches="tight",
-        pad_inches=0.01,
-    )
+    fig.savefig(output_dir / "edge_insertion_maintenance.pdf", bbox_inches="tight", pad_inches=0.01)
+    # fig.savefig(
+    #     output_dir / "edge_insertion_maintenance_1x6.png",
+    #     dpi=600,
+    #     bbox_inches="tight",
+    #     pad_inches=0.01,
+    # )
+    plt.show()
+
 
 
 if __name__ == "__main__":
