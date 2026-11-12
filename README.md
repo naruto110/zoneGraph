@@ -11,7 +11,7 @@ edge-level graph updates
   -> append-only self-describing ZNS records
 ```
 
-The project accompanies the paper draft "zoneGraph: A ZNS-native Design for Dynamic Graphs".
+The project accompanies the paper draft "ZoneGraph: A Logical Block-Version Architecture for Dynamic Graph Storage on ZNS SSDs".
 
 ## Core Ideas
 
